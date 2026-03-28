@@ -12,21 +12,23 @@ from typing import Any
 import cv2
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
+import database as db
 from actions import ActionEngine
-from anomaly import AnomalyDetector, AnomalyPhase
+from anomaly import AnomalyPhase
+from camera_manager import CameraManager, CameraSession
 from detector import Detector
-from memory import SceneMemory
-from models import Alert, MonitoringPlan, Rule, WSMessage, Zone
+from middleware import verify_ws_token
+from models import Alert, Camera, Condition, MonitoringPlan, Rule, WSMessage, Zone
 from narrator import Narrator
 from plan_generator import PlanGenerator
 from reasoner import Reasoner
-from replay_buffer import ReplayBuffer
-from rule_engine import RuleEngine
 from rule_parser import RuleParser
 from scene_analyzer import SceneAnalyzer
+from storage import create_frame_store
 from zone_generator import ZoneGenerator
 
 load_dotenv()
@@ -34,44 +36,25 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("watchtower")
 
 # ---------------------------------------------------------------------------
-# Global state
+# Shared singletons (one instance, shared across all cameras)
 # ---------------------------------------------------------------------------
 
 detector = Detector()
-rule_engine = RuleEngine()
+narrator = Narrator()
+reasoner = Reasoner()
 rule_parser = RuleParser()
 plan_generator = PlanGenerator()
 zone_generator = ZoneGenerator()
-narrator = Narrator()
-replay_buffer = ReplayBuffer(max_seconds=1800, fps=2)
 scene_analyzer = SceneAnalyzer()
-reasoner = Reasoner()
 action_engine = ActionEngine()
-scene_memory = SceneMemory()
-anomaly_detector = AnomalyDetector()
+frame_store = create_frame_store()
+camera_mgr = CameraManager()
 
-zones: list[Zone] = []
-rules: list[Rule] = []
-alerts: list[Alert] = []
+# Pending plans (keyed by plan ID, temporary)
 pending_plans: dict[str, MonitoringPlan] = {}
-connected_clients: list[WebSocket] = []
 
-camera: cv2.VideoCapture | None = None
-camera_running = False
-camera_source: str | int = int(os.getenv("WATCHTOWER_CAMERA", "0"))  # index or URL
-
-# Remote camera frame buffer (pushed by /ws/camera clients)
-remote_frame: np.ndarray | None = None
-remote_camera_connected = False
-
-# Feature toggles
-reasoning_enabled = False
-narration_enabled = False
-bootstrap_sent = False
-
-# Latest state for new features
-latest_detections: list = []
-latest_frame: np.ndarray | None = None
+# Frontend client tracking: ws -> subscribed camera_id
+frontend_clients: dict[WebSocket, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -79,357 +62,256 @@ latest_frame: np.ndarray | None = None
 # ---------------------------------------------------------------------------
 
 def frame_to_b64(frame: np.ndarray, quality: int = 70) -> str:
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
+    if frame is None or frame.size == 0:
         return ""
-    return base64.b64encode(buf.tobytes()).decode("ascii")
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
 
 
-async def broadcast(msg: WSMessage) -> None:
+async def broadcast(session: CameraSession, msg: WSMessage) -> None:
+    """Send message to all frontend viewers of this camera."""
     raw = msg.model_dump_json()
     dead: list[WebSocket] = []
-    for ws in connected_clients:
+    for ws in session.viewers:
         try:
             await ws.send_text(raw)
         except Exception:
             dead.append(ws)
     for ws in dead:
-        connected_clients.remove(ws)
+        session.viewers.remove(ws)
+        frontend_clients.pop(ws, None)
 
 
-async def broadcast_event(event_type: str, payload: dict[str, Any]) -> None:
-    """Helper for action engine callbacks."""
-    await broadcast(WSMessage(type=event_type, payload=payload))
+async def broadcast_event(session: CameraSession, event_type: str, payload: dict[str, Any]) -> None:
+    """Helper for action engine callbacks (wraps broadcast)."""
+    await broadcast(session, WSMessage(type=event_type, payload=payload))
+
+
+def _persist(coro) -> None:
+    """Fire-and-forget a DB write coroutine."""
+    asyncio.create_task(coro)
 
 
 # ---------------------------------------------------------------------------
-# Camera loop
+# Per-camera processing loops
 # ---------------------------------------------------------------------------
 
-async def _get_next_frame() -> np.ndarray | None:
-    """Get next frame from local camera or remote camera buffer."""
-    global remote_frame
-    if remote_camera_connected and remote_frame is not None:
-        frame = remote_frame
-        remote_frame = None  # consume it
-        return frame
-    if camera is not None and camera.isOpened():
-        ok, frame = camera.read()
-        return frame if ok else None
-    return None
-
-
-async def camera_loop() -> None:
-    global camera, camera_running, bootstrap_sent, latest_detections, latest_frame
-
-    # Try local camera if no remote camera is connected
-    use_local = os.getenv("WATCHTOWER_NO_CAMERA") != "1" and not remote_camera_connected
-    if use_local:
-        source = camera_source
-        # Try parsing as URL string
-        if isinstance(source, str) and not source.isdigit():
-            camera = cv2.VideoCapture(source)
-        else:
-            camera = cv2.VideoCapture(int(source) if isinstance(source, str) else source)
-        if not camera.isOpened():
-            log.warning("No local camera at source %s — waiting for remote camera", source)
-            camera = None
-
-    camera_running = True
-    if camera is not None:
-        log.info("Camera started (local source: %s)", camera_source)
-    else:
-        log.info("Camera loop started — waiting for remote camera feed")
-
-    frame_interval = 1.0 / 24  # target ~24 fps
+async def camera_processing_loop(session: CameraSession) -> None:
+    """Main detection + rule evaluation loop for one camera."""
+    log.info("Processing started for camera %s", session.camera_id)
+    frame_interval = 1.0 / 24
     last_frame_time = 0.0
-    first_frame_captured = False
+    first_frame = True
 
-    while camera_running:
+    while True:
         now = time.time()
         if now - last_frame_time < frame_interval:
             await asyncio.sleep(0.003)
             continue
 
-        frame = await _get_next_frame()
+        frame = session.latest_frame
         if frame is None:
             await asyncio.sleep(0.05)
             continue
 
         last_frame_time = now
-        latest_frame = frame
 
-        # Auto-bootstrap on first frame (Block 1)
-        if not first_frame_captured and not bootstrap_sent:
-            first_frame_captured = True
-            asyncio.create_task(_auto_bootstrap(frame))
+        # Auto-bootstrap on first frame
+        if first_frame and not session.bootstrap_sent:
+            first_frame = False
+            session.bootstrap_sent = True
+            asyncio.create_task(_auto_bootstrap(session, frame))
 
-        # Only run pose estimation if any rule uses pose conditions
+        # YOLO + pose detection
         pose_types = {"person_pose", "person_falling"}
         need_pose = any(
-            c.type in pose_types
-            for r in rules if r.enabled
-            for c in r.conditions
+            c.type in pose_types for r in session.rules if r.enabled for c in r.conditions
         )
-
-        # Run detection in thread pool so it doesn't block the event loop
         loop = asyncio.get_event_loop()
-        detections = await loop.run_in_executor(
-            None, detector.detect, frame, need_pose
-        )
-        latest_detections = detections
+        detections = await loop.run_in_executor(None, detector.detect, frame, need_pose)
+        session.latest_detections = detections
 
-        # Store in replay buffer
-        replay_buffer.add_frame(frame, now)
+        # Replay buffer
+        session.replay_buffer.add_frame(frame, now)
 
-        # Anomaly detection (Block 6)
-        if anomaly_detector.phase == AnomalyPhase.LEARNING:
-            done = anomaly_detector.learn_frame(frame)
+        # Anomaly detection
+        ad = session.anomaly_detector
+        if ad.phase == AnomalyPhase.LEARNING:
+            done = ad.learn_frame(frame)
             if done:
-                await broadcast(WSMessage(type="anomaly_status", payload={
-                    "phase": "detecting",
-                    "time_remaining": 0,
-                }))
-        elif anomaly_detector.phase == AnomalyPhase.DETECTING:
-            # Check every 2 seconds (not every frame)
-            if not hasattr(camera_loop, "_last_anomaly") or now - camera_loop._last_anomaly > 2.0:  # type: ignore[attr-defined]
-                camera_loop._last_anomaly = now  # type: ignore[attr-defined]
-                score = anomaly_detector.detect(frame)
-                await broadcast(WSMessage(type="anomaly_score", payload={
-                    "score": round(score, 3),
-                    "timestamp": now,
-                }))
-                # Cooldown: only fire anomaly alert every 30 seconds
-                last_anomaly_alert = getattr(camera_loop, "_last_anomaly_alert", 0.0)
-                if score > anomaly_detector.threshold and now - last_anomaly_alert > 30.0:
-                    camera_loop._last_anomaly_alert = now  # type: ignore[attr-defined]
-                    asyncio.create_task(_handle_anomaly_alert(frame, score, now))
+                await broadcast(session, WSMessage(type="anomaly_status", payload={"phase": "detecting", "time_remaining": 0}))
+        elif ad.phase == AnomalyPhase.DETECTING:
+            last_check = getattr(session, "_last_anomaly_check", 0.0)
+            if now - last_check > 2.0:
+                session._last_anomaly_check = now  # type: ignore[attr-defined]
+                score = ad.detect(frame)
+                await broadcast(session, WSMessage(type="anomaly_score", payload={"score": round(score, 3), "timestamp": now}))
+                last_alert_t = getattr(session, "_last_anomaly_alert", 0.0)
+                if score > ad.threshold and now - last_alert_t > 30.0:
+                    session._last_anomaly_alert = now  # type: ignore[attr-defined]
+                    asyncio.create_task(_handle_anomaly_alert(session, frame, score, now))
 
-        # Check rules
-        fired = rule_engine.evaluate(rules, zones, detections, now)
-
-        # Process fired alerts: verify with LLM before broadcasting
+        # Rule evaluation
+        fired = session.rule_engine.evaluate(session.rules, session.zones, detections, now)
         for alert in fired:
+            alert.camera_id = session.camera_id
             alert.frame_b64 = frame_to_b64(frame, quality=80)
-            asyncio.create_task(_verify_and_broadcast_alert(alert, frame))
+            asyncio.create_task(_verify_and_broadcast_alert(session, alert, frame))
 
-        # Encode frame off the event loop
-        frame_b64 = await loop.run_in_executor(
-            None, frame_to_b64, frame, 50
-        )
+        # Broadcast frame
+        frame_b64 = await loop.run_in_executor(None, frame_to_b64, frame, 50)
+        await broadcast(session, WSMessage(type="frame", payload={
+            "frame": frame_b64,
+            "detections": [d.model_dump() for d in detections],
+            "timestamp": now,
+            "fps": round(1.0 / max(time.time() - now, 0.001)),
+        }))
 
-        # Broadcast frame + detections
-        await broadcast(WSMessage(
-            type="frame",
-            payload={
-                "frame": frame_b64,
-                "detections": [d.model_dump() for d in detections],
-                "timestamp": now,
-                "fps": round(1.0 / max(time.time() - now, 0.001)),
-            },
-        ))
+        # Heartbeat to DB every 30s
+        last_hb = getattr(session, "_last_heartbeat", 0.0)
+        if now - last_hb > 30.0:
+            session._last_heartbeat = now  # type: ignore[attr-defined]
+            _persist(db.camera_heartbeat(session.camera_id))
 
-    camera.release()
-    log.info("Camera stopped")
+
+async def reasoning_loop(session: CameraSession) -> None:
+    while True:
+        await asyncio.sleep(10)
+        if not session.reasoning_enabled or not session.viewers:
+            continue
+        now = time.time()
+        all_frames = session.replay_buffer.get_frames(now - 10, 10)
+        if not all_frames:
+            continue
+        step = max(1, len(all_frames) // 4)
+        sampled = all_frames[::step][:4]
+        insight = await reasoner.analyze(sampled, session.latest_detections, session.rules, session.zones, session.alerts[-10:])
+        await broadcast(session, WSMessage(type="insight", payload={
+            "observation": insight.observation, "concerns": insight.concerns,
+            "suggested_alerts": insight.suggested_alerts, "prediction": insight.prediction, "timestamp": now,
+        }))
+        last_ra = getattr(session, "_last_reasoning_alert", 0.0)
+        if insight.suggested_alerts and now - last_ra > 60.0:
+            session._last_reasoning_alert = now  # type: ignore[attr-defined]
+            sa = insight.suggested_alerts[0]
+            alert = Alert(camera_id=session.camera_id, rule_id="reasoning", rule_name="AI Reasoning",
+                          severity=sa.get("severity", "medium"), timestamp=now,
+                          frame_b64=frame_to_b64(session.latest_frame, quality=80) if session.latest_frame is not None else "",
+                          narration=sa.get("reason", ""), detections=session.latest_detections[:5])
+            session.alerts.append(alert)
+            await broadcast(session, WSMessage(type="alert", payload=alert.model_dump()))
+            _persist(db.create_alert(alert))
+            asyncio.create_task(action_engine.execute(alert, lambda et, p: broadcast_event(session, et, p)))
+
+
+async def memory_loop(session: CameraSession) -> None:
+    while True:
+        await asyncio.sleep(30)
+        if session.latest_frame is None or not session.viewers:
+            continue
+        now = time.time()
+        entry = await session.scene_memory.add_entry(session.latest_frame, session.latest_detections, session.alerts[-10:], now)
+        if entry:
+            entry.camera_id = session.camera_id
+            _persist(db.create_memory_entry(session.camera_id, entry))
+
+
+async def narration_loop(session: CameraSession) -> None:
+    while True:
+        await asyncio.sleep(8)
+        if not session.narration_enabled or session.latest_frame is None or not session.viewers:
+            continue
+        text = await narrator.narrate_scene(session.latest_frame, session.latest_detections)
+        if text:
+            await broadcast(session, WSMessage(type="live_narration", payload={"text": text, "timestamp": time.time()}))
 
 
 # ---------------------------------------------------------------------------
-# Block 1: Auto-bootstrap
+# Alert handling
 # ---------------------------------------------------------------------------
 
-async def _auto_bootstrap(frame: np.ndarray) -> None:
-    global bootstrap_sent
-    bootstrap_sent = True
-    log.info("Running auto-bootstrap scene analysis...")
-
-    analysis = await scene_analyzer.analyze(frame)
-    if not analysis.scene_description:
-        log.warning("Scene analysis returned empty result")
-        bootstrap_sent = False
-        return
-
-    await broadcast(WSMessage(type="scene_analysis", payload={
-        "scene_type": analysis.scene_type,
-        "scene_description": analysis.scene_description,
-        "zones": analysis.zones,
-        "suggested_rules": analysis.suggested_rules,
-    }))
-
-
-# ---------------------------------------------------------------------------
-# Alert verification + actions
-# ---------------------------------------------------------------------------
-
-async def _verify_and_broadcast_alert(alert: Alert, frame: np.ndarray) -> None:
+async def _verify_and_broadcast_alert(session: CameraSession, alert: Alert, frame: np.ndarray) -> None:
     try:
         result = await narrator.verify(frame, alert)
         if not result.confirmed:
-            log.info("Alert '%s' rejected by LLM verification", alert.rule_name)
             return
         alert.narration = result.note
-        alerts.append(alert)
-        await broadcast(WSMessage(type="alert", payload=alert.model_dump()))
+        session.alerts.append(alert)
+        if len(session.alerts) > 100:
+            session.alerts = session.alerts[-100:]
+        await broadcast(session, WSMessage(type="alert", payload=alert.model_dump()))
         if result.note:
-            await broadcast(WSMessage(
-                type="narration",
-                payload={"alert_id": alert.id, "narration": result.note},
-            ))
-        # Block 3: Execute actions
-        asyncio.create_task(action_engine.execute(alert, broadcast_event))
+            await broadcast(session, WSMessage(type="narration", payload={"alert_id": alert.id, "narration": result.note}))
+        # Persist frame + alert
+        frame_bytes = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+        path = await frame_store.save_frame(alert.id, frame_bytes)
+        alert.frame_path = path
+        _persist(db.create_alert(alert, frame_path=path))
+        asyncio.create_task(action_engine.execute(alert, lambda et, p: broadcast_event(session, et, p)))
     except Exception as e:
         log.error("Verification failed: %s", e)
-        # On error, still broadcast (don't suppress real alerts)
-        alerts.append(alert)
-        await broadcast(WSMessage(type="alert", payload=alert.model_dump()))
+        session.alerts.append(alert)
+        await broadcast(session, WSMessage(type="alert", payload=alert.model_dump()))
 
 
-# ---------------------------------------------------------------------------
-# Block 6: Anomaly alert
-# ---------------------------------------------------------------------------
-
-async def _handle_anomaly_alert(frame: np.ndarray, score: float, timestamp: float) -> None:
-    """When anomaly score exceeds threshold, compare against baseline."""
+async def _handle_anomaly_alert(session: CameraSession, frame: np.ndarray, score: float, timestamp: float) -> None:
     try:
-        # Get a baseline frame for comparison
-        baseline_frames = anomaly_detector._baseline_frames
+        baseline_frames = session.anomaly_detector._baseline_frames
         if baseline_frames:
-            # Use middle baseline frame as representative (stored in color at 480x360)
             baseline = baseline_frames[len(baseline_frames) // 2]
             description = await narrator.compare_anomaly(baseline, frame, score)
         else:
-            description = await narrator.narrate_scene(frame, latest_detections)
+            description = await narrator.narrate_scene(frame, session.latest_detections)
         if not description:
             description = "Anomalous activity detected."
-
-        await broadcast(WSMessage(type="anomaly_detected", payload={
-            "score": round(score, 3),
-            "description": description,
-            "frame_b64": frame_to_b64(frame, quality=70),
-            "timestamp": timestamp,
-        }))
-
-        # Also create a regular alert for the anomaly
-        anomaly_alert = Alert(
-            rule_id="anomaly",
-            rule_name="Anomaly Detection",
-            severity="high" if score > 0.6 else "medium",
-            timestamp=timestamp,
-            frame_b64=frame_to_b64(frame, quality=80),
-            narration=description,
-            detections=latest_detections[:5],
-        )
-        alerts.append(anomaly_alert)
-        await broadcast(WSMessage(type="alert", payload=anomaly_alert.model_dump()))
-        asyncio.create_task(action_engine.execute(anomaly_alert, broadcast_event))
-
+        alert = Alert(camera_id=session.camera_id, rule_id="anomaly", rule_name="Anomaly Detection",
+                      severity="high" if score > 0.6 else "medium", timestamp=timestamp,
+                      frame_b64=frame_to_b64(frame, quality=80), narration=description, detections=session.latest_detections[:5])
+        session.alerts.append(alert)
+        await broadcast(session, WSMessage(type="alert", payload=alert.model_dump()))
+        await broadcast(session, WSMessage(type="anomaly_detected", payload={
+            "score": round(score, 3), "description": description, "frame_b64": alert.frame_b64, "timestamp": timestamp}))
+        _persist(db.create_alert(alert))
+        asyncio.create_task(action_engine.execute(alert, lambda et, p: broadcast_event(session, et, p)))
     except Exception as e:
-        log.error("Anomaly alert handling failed: %s", e)
+        log.error("Anomaly alert failed: %s", e)
+
+
+async def _auto_bootstrap(session: CameraSession, frame: np.ndarray) -> None:
+    log.info("Running auto-bootstrap for camera %s", session.camera_id)
+    analysis = await scene_analyzer.analyze(frame)
+    if not analysis.scene_description:
+        session.bootstrap_sent = False
+        return
+    await broadcast(session, WSMessage(type="scene_analysis", payload={
+        "scene_type": analysis.scene_type, "scene_description": analysis.scene_description,
+        "zones": analysis.zones, "suggested_rules": analysis.suggested_rules}))
 
 
 # ---------------------------------------------------------------------------
-# Block 2: Reasoning loop
+# Start/stop per-camera tasks
 # ---------------------------------------------------------------------------
 
-async def reasoning_loop() -> None:
-    """Background loop that runs LLM reasoning every ~10 seconds."""
-    while camera_running:
-        await asyncio.sleep(10)
-
-        if not reasoning_enabled or not connected_clients:
-            continue
-
-        # Grab frames from replay buffer (last 10 seconds, evenly spaced)
-        now = time.time()
-        all_frames = replay_buffer.get_frames(now - 10, 10)
-        if not all_frames:
-            continue
-
-        # Sample up to 4 frames evenly
-        step = max(1, len(all_frames) // 4)
-        sampled = all_frames[::step][:4]
-
-        insight = await reasoner.analyze(
-            frames=sampled,
-            detections=latest_detections,
-            active_rules=rules,
-            active_zones=zones,
-            recent_alerts=alerts[-10:],
-        )
-
-        await broadcast(WSMessage(type="insight", payload={
-            "observation": insight.observation,
-            "concerns": insight.concerns,
-            "suggested_alerts": insight.suggested_alerts,
-            "prediction": insight.prediction,
-            "timestamp": now,
-        }))
-
-        # Process any suggested alerts from the reasoning engine (with cooldown)
-        last_reasoning_alert = getattr(reasoning_loop, "_last_alert", 0.0)
-        if insight.suggested_alerts and now - last_reasoning_alert > 60.0:
-            reasoning_loop._last_alert = now  # type: ignore[attr-defined]
-            # Only take the first (most important) suggestion per cycle
-            sa = insight.suggested_alerts[0]
-            alert = Alert(
-                rule_id="reasoning",
-                rule_name="AI Reasoning",
-                severity=sa.get("severity", "medium"),
-                timestamp=now,
-                frame_b64=frame_to_b64(latest_frame, quality=80) if latest_frame is not None else "",
-                narration=sa.get("reason", ""),
-                detections=latest_detections[:5],
-            )
-            alerts.append(alert)
-            await broadcast(WSMessage(type="alert", payload=alert.model_dump()))
-            asyncio.create_task(action_engine.execute(alert, broadcast_event))
+async def start_camera_tasks(session: CameraSession) -> None:
+    """Spawn all background tasks for a camera session."""
+    session.processing_task = asyncio.create_task(camera_processing_loop(session))
+    asyncio.create_task(reasoning_loop(session))
+    asyncio.create_task(memory_loop(session))
+    asyncio.create_task(narration_loop(session))
 
 
-# ---------------------------------------------------------------------------
-# Block 4: Memory loop
-# ---------------------------------------------------------------------------
-
-async def memory_loop() -> None:
-    """Background loop that creates scene memory entries every ~30 seconds."""
-    while camera_running:
-        await asyncio.sleep(30)
-
-        if latest_frame is None or not connected_clients:
-            continue
-
-        now = time.time()
-        entry = await scene_memory.add_entry(
-            frame=latest_frame,
-            detections=latest_detections,
-            recent_alerts=alerts[-10:],
-            timestamp=now,
-        )
-
-        if entry:
-            await broadcast(WSMessage(type="memory_entry", payload={
-                "timestamp": entry.timestamp,
-                "summary": entry.summary,
-            }))
-
-
-# ---------------------------------------------------------------------------
-# Block 5: Narration loop
-# ---------------------------------------------------------------------------
-
-async def narration_loop() -> None:
-    """Background loop for continuous live narration every ~8 seconds."""
-    while camera_running:
-        await asyncio.sleep(8)
-
-        if not narration_enabled or latest_frame is None or not connected_clients:
-            continue
-
-        text = await narrator.narrate_scene(latest_frame, latest_detections)
-        if text:
-            now = time.time()
-            await broadcast(WSMessage(type="live_narration", payload={
-                "text": text,
-                "timestamp": now,
-            }))
+async def load_session_from_db(session: CameraSession) -> None:
+    """Load persisted zones, rules, alerts into a session."""
+    session.zones = await db.list_zones(session.camera_id)
+    session.rules = await db.list_rules(session.camera_id)
+    # Load recent alerts (last 50)
+    raw_alerts = await db.list_alerts(session.camera_id, limit=50)
+    for ra in raw_alerts:
+        session.alerts.append(Alert(
+            id=ra["id"], camera_id=ra["camera_id"], rule_id=ra["rule_id"],
+            rule_name=ra["rule_name"], severity=ra["severity"], timestamp=ra["timestamp"],
+            narration=ra.get("narration", ""), frame_path=ra.get("frame_path", ""),
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -438,568 +320,507 @@ async def narration_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    tasks: list[asyncio.Task] = []
+    await db.init_db()
+
+    # Load all cameras from DB
+    cameras = await db.list_cameras()
+    if not cameras:
+        default_cam = Camera(name="Default Camera")
+        await db.create_camera(default_cam)
+        cameras = [default_cam]
+
+    for cam in cameras:
+        session = camera_mgr.get_or_create_session(cam.id, cam.name)
+        await load_session_from_db(session)
+
+    # Optional local camera for backwards compat
     if os.getenv("WATCHTOWER_NO_CAMERA") != "1":
-        tasks.append(asyncio.create_task(camera_loop()))
-        tasks.append(asyncio.create_task(reasoning_loop()))
-        tasks.append(asyncio.create_task(memory_loop()))
-        tasks.append(asyncio.create_task(narration_loop()))
-    else:
-        log.info("Camera disabled (WATCHTOWER_NO_CAMERA=1)")
+        source = os.getenv("WATCHTOWER_CAMERA", "0")
+        cam_source: int | str = int(source) if source.isdigit() else source
+        cap = cv2.VideoCapture(cam_source)
+        if cap.isOpened():
+            default_session = camera_mgr.get_session(cameras[0].id)
+            if default_session:
+                log.info("Local camera %s attached to %s", cam_source, cameras[0].name)
+                asyncio.create_task(_local_camera_feeder(cap, default_session))
+                await start_camera_tasks(default_session)
+        else:
+            log.warning("Cannot open local camera %s", cam_source)
+            cap.release()
+
     yield
-    global camera_running
-    camera_running = False
-    for task in tasks:
-        task.cancel()
+
+    # Cleanup
+    for session in camera_mgr.list_sessions():
+        if session.processing_task:
+            session.processing_task.cancel()
+    await db.close_db()
+
+
+async def _local_camera_feeder(cap: cv2.VideoCapture, session: CameraSession) -> None:
+    """Feed frames from a local OpenCV camera into a session."""
+    frame_interval = 1.0 / 24
+    last = 0.0
+    while True:
+        now = time.time()
+        if now - last < frame_interval:
+            await asyncio.sleep(0.003)
+            continue
+        ok, frame = cap.read()
+        if not ok:
+            await asyncio.sleep(0.01)
+            continue
+        last = now
+        session.latest_frame = frame
 
 
 # ---------------------------------------------------------------------------
-# App
+# App + REST routes
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="WatchTower", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Mount REST routes
+from routes.auth_routes import router as auth_router
+from routes.cameras import router as cameras_router
+from routes.zones import router as zones_router
+from routes.rules import router as rules_router
+from routes.alerts import router as alerts_router
+
+app.include_router(auth_router)
+app.include_router(cameras_router)
+app.include_router(zones_router)
+app.include_router(rules_router)
+app.include_router(alerts_router)
+
+# Serve stored frames
+os.makedirs("data/frames", exist_ok=True)
+app.mount("/data", StaticFiles(directory="data"), name="data")
 
 
 # ---------------------------------------------------------------------------
-# WebSocket handler
+# Camera WebSocket (devices push frames here)
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Remote camera WebSocket endpoint
-# ---------------------------------------------------------------------------
-
-@app.websocket("/ws/camera")
-async def camera_feed_endpoint(ws: WebSocket) -> None:
-    """Accepts frames from remote camera clients (Pi, phone, etc).
-
-    Camera clients send binary JPEG frames or JSON with base64 frame.
-    """
-    global remote_frame, remote_camera_connected
+@app.websocket("/ws/camera/{camera_id}")
+async def camera_feed_endpoint(ws: WebSocket, camera_id: str) -> None:
     await ws.accept()
-    remote_camera_connected = True
-    log.info("Remote camera connected")
+
+    # Auto-register camera if new
+    cam = await db.get_camera(camera_id)
+    if not cam:
+        cam = Camera(id=camera_id, name=f"Camera {camera_id[:4]}")
+        await db.create_camera(cam)
+
+    await db.camera_heartbeat(camera_id)
+    session = camera_mgr.get_or_create_session(camera_id, cam.name)
+    session.camera_ws = ws
+    await load_session_from_db(session)
+    await start_camera_tasks(session)
+    log.info("Camera %s connected", camera_id)
+
+    # Notify frontend clients
+    for fws in frontend_clients:
+        try:
+            await fws.send_text(WSMessage(type="camera_online", payload={"camera_id": camera_id, "name": cam.name}).model_dump_json())
+        except Exception:
+            pass
 
     try:
         while True:
             data = await ws.receive()
             if "bytes" in data and data["bytes"]:
-                # Binary JPEG frame — decode directly
                 buf = np.frombuffer(data["bytes"], dtype=np.uint8)
                 frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
                 if frame is not None:
-                    remote_frame = frame
+                    session.latest_frame = frame
             elif "text" in data and data["text"]:
-                # JSON with base64 frame
                 msg = json.loads(data["text"])
                 if "frame" in msg:
-                    import base64 as b64mod
-                    raw = b64mod.b64decode(msg["frame"])
+                    raw = base64.b64decode(msg["frame"])
                     buf = np.frombuffer(raw, dtype=np.uint8)
                     frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
                     if frame is not None:
-                        remote_frame = frame
+                        session.latest_frame = frame
     except WebSocketDisconnect:
         pass
     finally:
-        remote_camera_connected = False
-        remote_frame = None
-        log.info("Remote camera disconnected")
+        session.camera_ws = None
+        session.latest_frame = None
+        if session.processing_task:
+            session.processing_task.cancel()
+            session.processing_task = None
+        await db.camera_offline(camera_id)
+        log.info("Camera %s disconnected", camera_id)
+        for fws in frontend_clients:
+            try:
+                await fws.send_text(WSMessage(type="camera_offline", payload={"camera_id": camera_id}).model_dump_json())
+            except Exception:
+                pass
+
+
+# Backwards compat: /ws/camera without ID
+@app.websocket("/ws/camera")
+async def camera_feed_legacy(ws: WebSocket) -> None:
+    await ws.accept()
+    cameras = await db.list_cameras()
+    camera_id = cameras[0].id if cameras else "default"
+    session = camera_mgr.get_or_create_session(camera_id)
+    session.camera_ws = ws
+    if not session.processing_task:
+        await start_camera_tasks(session)
+    try:
+        while True:
+            data = await ws.receive()
+            if "bytes" in data and data["bytes"]:
+                buf = np.frombuffer(data["bytes"], dtype=np.uint8)
+                frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    session.latest_frame = frame
+    except WebSocketDisconnect:
+        pass
+    finally:
+        session.camera_ws = None
 
 
 # ---------------------------------------------------------------------------
-# Frontend WebSocket endpoint
+# Frontend WebSocket
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket) -> None:
+async def websocket_endpoint(ws: WebSocket, token: str = Query(default=None)) -> None:
     await ws.accept()
-    connected_clients.append(ws)
-    log.info("Client connected (%d total)", len(connected_clients))
 
-    # Send current state on connect
-    await ws.send_text(WSMessage(
-        type="init",
-        payload={
-            "zones": [z.model_dump() for z in zones],
-            "rules": [r.model_dump() for r in rules],
-            "alerts": [a.model_dump() for a in alerts[-50:]],
-            "reasoning_enabled": reasoning_enabled,
-            "narration_enabled": narration_enabled,
-            "anomaly_phase": anomaly_detector.phase.value,
-            "action_config": action_engine.config,
-            "camera_source": str(camera_source),
-        },
-    ).model_dump_json())
+    # Optional auth (don't block if no token — dev mode)
+    user = verify_ws_token(token) if token else None
+
+    # Default subscribe to first camera
+    cameras = await db.list_cameras()
+    default_cam_id = cameras[0].id if cameras else "default"
+    session = camera_mgr.get_or_create_session(default_cam_id)
+    session.viewers.append(ws)
+    frontend_clients[ws] = default_cam_id
+
+    log.info("Frontend connected (camera: %s, auth: %s)", default_cam_id, "yes" if user else "no")
+
+    # Send init
+    await ws.send_text(WSMessage(type="init", payload={
+        "cameras": [c.model_dump() for c in cameras],
+        "camera_id": default_cam_id,
+        "zones": [z.model_dump() for z in session.zones],
+        "rules": [r.model_dump() for r in session.rules],
+        "alerts": [a.model_dump() for a in session.alerts[-50:]],
+        "reasoning_enabled": session.reasoning_enabled,
+        "narration_enabled": session.narration_enabled,
+        "anomaly_phase": session.anomaly_detector.phase.value,
+        "action_config": action_engine.config,
+    }).model_dump_json())
 
     try:
         while True:
             raw = await ws.receive_text()
             msg = WSMessage.model_validate_json(raw)
-            await _handle_message(ws, msg)
+            cam_id = frontend_clients.get(ws, default_cam_id)
+            sess = camera_mgr.get_session(cam_id) or session
+            await _handle_message(sess, ws, msg)
     except WebSocketDisconnect:
         pass
     finally:
-        if ws in connected_clients:
-            connected_clients.remove(ws)
-        log.info("Client disconnected (%d total)", len(connected_clients))
+        await camera_mgr.remove_viewer(ws)
+        frontend_clients.pop(ws, None)
+        log.info("Frontend disconnected")
 
 
-async def _handle_message(ws: WebSocket, msg: WSMessage) -> None:
+# ---------------------------------------------------------------------------
+# Message handlers (operate on per-camera session)
+# ---------------------------------------------------------------------------
+
+async def _handle_message(session: CameraSession, ws: WebSocket, msg: WSMessage) -> None:
     handler = _message_handlers.get(msg.type)
     if handler:
-        await handler(ws, msg.payload)
+        await handler(session, ws, msg.payload)
     else:
         log.warning("Unknown message type: %s", msg.type)
 
 
-# ---------------------------------------------------------------------------
-# Message handlers
-# ---------------------------------------------------------------------------
-
-async def _handle_add_rule(ws: WebSocket, payload: dict[str, Any]) -> None:
-    text = payload.get("text", "")
-    if not text:
+async def _handle_subscribe(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    """Switch which camera this frontend is viewing."""
+    camera_id = payload.get("camera_id", "")
+    new_session = camera_mgr.get_session(camera_id)
+    if not new_session:
         return
-
-    severity = payload.get("severity", "medium")
-    zone_names = [z.name for z in zones]
-    result = await rule_parser.parse(text, zone_names, severity=severity)
-    if result:
-        rule, missing_zones = result
-        rules.append(rule)
-        rule_payload = rule.model_dump()
-        if missing_zones:
-            rule_payload["_missing_zones"] = missing_zones
-        await broadcast(WSMessage(
-            type="rule_added",
-            payload=rule_payload,
-        ))
-
-
-async def _handle_update_rule(ws: WebSocket, payload: dict[str, Any]) -> None:
-    rule_id = payload.get("id", "")
-    for i, r in enumerate(rules):
-        if r.id == rule_id:
-            updated = r.model_copy(update={
-                k: v for k, v in payload.items()
-                if k != "id" and hasattr(r, k)
-            })
-            rules[i] = updated
-            await broadcast(WSMessage(
-                type="rule_updated",
-                payload=updated.model_dump(),
-            ))
-            return
-
-
-async def _handle_delete_rule(ws: WebSocket, payload: dict[str, Any]) -> None:
-    rule_id = payload.get("id", "")
-    for i, r in enumerate(rules):
-        if r.id == rule_id:
-            rules.pop(i)
-            await broadcast(WSMessage(
-                type="rule_deleted",
-                payload={"id": rule_id},
-            ))
-            return
-
-
-async def _handle_toggle_rule(ws: WebSocket, payload: dict[str, Any]) -> None:
-    rule_id = payload.get("id", "")
-    for i, r in enumerate(rules):
-        if r.id == rule_id:
-            updated = r.model_copy(update={"enabled": not r.enabled})
-            rules[i] = updated
-            await broadcast(WSMessage(
-                type="rule_updated",
-                payload=updated.model_dump(),
-            ))
-            return
-
-
-async def _handle_update_zones(ws: WebSocket, payload: dict[str, Any]) -> None:
-    global zones
-    raw_zones = payload.get("zones", [])
-    zones = [Zone.model_validate(z) for z in raw_zones]
-    await broadcast(WSMessage(
-        type="zones_updated",
-        payload={"zones": [z.model_dump() for z in zones]},
-    ))
-
-
-async def _handle_auto_zones(ws: WebSocket, payload: dict[str, Any]) -> None:
-    global zones
-    if camera is None or not camera.isOpened():
-        return
-
-    ok, frame = camera.read()
-    if not ok:
-        return
-
-    generated = await zone_generator.generate(frame)
-    zones = generated
-    await broadcast(WSMessage(
-        type="zones_updated",
-        payload={"zones": [z.model_dump() for z in zones]},
-    ))
-
-
-async def _handle_get_replay(ws: WebSocket, payload: dict[str, Any]) -> None:
-    timestamp = payload.get("timestamp", 0.0)
-    duration = payload.get("duration", 10.0)
-    frames = replay_buffer.get_frames(timestamp, duration)
-    await ws.send_text(WSMessage(
-        type="replay",
-        payload={
-            "frames": [
-                {"frame": frame_to_b64(f, quality=50), "timestamp": t}
-                for f, t in frames
-            ],
-        },
-    ).model_dump_json())
-
-
-async def _handle_get_replay_timestamps(ws: WebSocket, payload: dict[str, Any]) -> None:
-    timestamps = replay_buffer.get_timestamps()
-    await ws.send_text(WSMessage(
-        type="replay_timestamps",
-        payload={
-            "start": timestamps[0] if timestamps else 0,
-            "end": timestamps[-1] if timestamps else 0,
-            "count": len(timestamps),
-        },
-    ).model_dump_json())
-
-
-async def _handle_get_frame_at(ws: WebSocket, payload: dict[str, Any]) -> None:
-    timestamp = payload.get("timestamp", 0.0)
-    result = replay_buffer.get_frame_at(timestamp)
-    if result is None:
-        await ws.send_text(WSMessage(
-            type="replay_frame",
-            payload={"frame": None, "timestamp": 0},
-        ).model_dump_json())
-        return
-    frame, ts = result
-    await ws.send_text(WSMessage(
-        type="replay_frame",
-        payload={"frame": frame_to_b64(frame, quality=60), "timestamp": ts},
-    ).model_dump_json())
-
-
-async def _handle_clear_alerts(ws: WebSocket, payload: dict[str, Any]) -> None:
-    global alerts
-    alerts = []
-    await broadcast(WSMessage(type="alerts_cleared", payload={}))
-
-
-async def _handle_clear_rules(ws: WebSocket, payload: dict[str, Any]) -> None:
-    global rules
-    rules = []
-    rule_engine._last_fired.clear()
-    rule_engine._duration_tracking.clear()
-    await broadcast(WSMessage(type="rules_cleared", payload={}))
-
-
-async def _handle_reset_all(ws: WebSocket, payload: dict[str, Any]) -> None:
-    """Reset everything back to initial state and re-trigger bootstrap."""
-    global zones, rules, alerts, bootstrap_sent, reasoning_enabled, narration_enabled
-
-    # Clear all state
-    zones = []
-    rules = []
-    alerts = []
-    pending_plans.clear()
-    rule_engine._last_fired.clear()
-    rule_engine._duration_tracking.clear()
-    scene_memory._entries.clear()
-    anomaly_detector.stop()
-    reasoning_enabled = False
-    narration_enabled = False
-    bootstrap_sent = False
-
-    # Broadcast all clears
-    await broadcast(WSMessage(type="zones_updated", payload={"zones": []}))
-    await broadcast(WSMessage(type="rules_cleared", payload={}))
-    await broadcast(WSMessage(type="alerts_cleared", payload={}))
-    await broadcast(WSMessage(type="reasoning_toggled", payload={"enabled": False}))
-    await broadcast(WSMessage(type="narration_toggled", payload={"enabled": False}))
-    await broadcast(WSMessage(type="anomaly_status", payload={"phase": "off", "time_remaining": 0}))
-
-    log.info("Full reset — re-triggering bootstrap")
-
-    # Re-trigger bootstrap from current frame
-    if camera is not None and camera.isOpened():
-        ok, frame = camera.read()
-        if ok:
-            asyncio.create_task(_auto_bootstrap(frame))
-
-
-async def _handle_switch_camera(ws: WebSocket, payload: dict[str, Any]) -> None:
-    """Switch camera source at runtime. Accepts index (0, 1) or URL (rtsp://, http://)."""
-    global camera, camera_source, bootstrap_sent
-    source = payload.get("source", 0)
-
-    # Parse source: integer index or string URL
-    if isinstance(source, str) and source.isdigit():
-        source = int(source)
-    camera_source = source
-
-    # Close current camera
-    if camera is not None and camera.isOpened():
-        camera.release()
-
-    # Open new source
-    camera = cv2.VideoCapture(camera_source)
-    if not camera.isOpened():
-        log.error("Cannot open camera source: %s", camera_source)
-        await ws.send_text(WSMessage(
-            type="camera_error",
-            payload={"error": f"Cannot open camera: {camera_source}"},
-        ).model_dump_json())
-        return
-
-    log.info("Switched camera to: %s", camera_source)
-
-    # Re-trigger bootstrap for the new view
-    bootstrap_sent = False
-    ok, frame = camera.read()
-    if ok:
-        asyncio.create_task(_auto_bootstrap(frame))
-
-    await broadcast(WSMessage(type="camera_switched", payload={"source": str(camera_source)}))
-
-
-# --- Plan generator handlers (API repo only) ---
-
-async def _handle_generate_plan(ws: WebSocket, payload: dict[str, Any]) -> None:
-    text = payload.get("text", "")
-    if not text:
-        return
-
-    # Auto-generate zones if none exist and camera is available
-    plan_zones: list[Zone] = []
-    zone_names = [z.name for z in zones]
-    if not zones and camera is not None and camera.isOpened():
-        ok, frame = camera.read()
-        if ok:
-            generated = await zone_generator.generate(frame)
-            plan_zones = generated
-            zone_names = [z.name for z in generated]
-
-    # Classify and generate
-    result = await plan_generator.classify_and_generate(text, zone_names)
-    if result is None:
-        await ws.send_text(WSMessage(
-            type="plan_error",
-            payload={"error": "Failed to process. Try again."},
-        ).model_dump_json())
-        return
-
-    if result["type"] == "rule":
-        # Single rule — use existing flow
-        rule = result["rule"]
-        rules.append(rule)
-        rule_payload = rule.model_dump()
-        missing = result.get("missing_zones", [])
-        if missing:
-            rule_payload["_missing_zones"] = missing
-        await broadcast(WSMessage(type="rule_added", payload=rule_payload))
-
-    elif result["type"] == "scenario":
-        # Multi-rule plan — store pending and send to requesting client
-        plan_data = result["plan"]
-        plan = MonitoringPlan(
-            name=plan_data["name"],
-            description=plan_data["description"],
-            scenario=plan_data["scenario"],
-            rules=plan_data["rules"],
-            zones=plan_zones,
-        )
-        pending_plans[plan.id] = plan
-        await ws.send_text(WSMessage(
-            type="plan_generated",
-            payload=plan.model_dump(),
-        ).model_dump_json())
-
-
-async def _handle_apply_plan(ws: WebSocket, payload: dict[str, Any]) -> None:
-    global zones
-    plan_id = payload.get("plan_id", "")
-    plan = pending_plans.pop(plan_id, None)
-    if plan is None:
-        return
-
-    # Commit zones if the plan generated new ones
-    if plan.zones:
-        zones = plan.zones
-        await broadcast(WSMessage(
-            type="zones_updated",
-            payload={"zones": [z.model_dump() for z in zones]},
-        ))
-
-    # Commit each rule
-    for rule in plan.rules:
-        rules.append(rule)
-        await broadcast(WSMessage(type="rule_added", payload=rule.model_dump()))
-
-    # Confirm
-    await broadcast(WSMessage(
-        type="plan_applied",
-        payload={"plan_id": plan_id},
-    ))
-
-
-# --- Block 1: Bootstrap handlers ---
-
-async def _handle_approve_bootstrap(ws: WebSocket, payload: dict[str, Any]) -> None:
-    global zones
-    from models import Condition
-
-    raw_zones = payload.get("zones", [])
-    raw_rules = payload.get("rules", [])
-
-    # Create zones
-    colors = [
-        "#22d3ee", "#a78bfa", "#34d399", "#fb923c",
-        "#f472b6", "#facc15", "#60a5fa", "#e879f9",
-    ]
-    new_zones: list[Zone] = []
-    for i, z in enumerate(raw_zones):
-        new_zones.append(Zone(
-            name=z["name"],
-            x=float(z.get("x", 0)),
-            y=float(z.get("y", 0)),
-            width=float(z.get("width", 0)),
-            height=float(z.get("height", 0)),
-            color=colors[i % len(colors)],
-        ))
-    zones = new_zones
-
-    # Create rules
-    new_rules: list[Rule] = []
-    for r in raw_rules:
-        conditions = [
-            Condition(type=c["type"], params=c.get("params", {}))
-            for c in r.get("conditions", [])
-        ]
-        new_rules.append(Rule(
-            name=r.get("name", "Unnamed"),
-            natural_language=r.get("natural_language", r.get("name", "")),
-            conditions=conditions,
-            severity=r.get("severity", "medium"),
-        ))
-    rules.extend(new_rules)
-
-    # Broadcast updates
-    await broadcast(WSMessage(
-        type="zones_updated",
-        payload={"zones": [z.model_dump() for z in zones]},
-    ))
-    for rule in new_rules:
-        await broadcast(WSMessage(type="rule_added", payload=rule.model_dump()))
-
-    log.info("Bootstrap approved: %d zones, %d rules", len(new_zones), len(new_rules))
-
-
-async def _handle_dismiss_bootstrap(ws: WebSocket, payload: dict[str, Any]) -> None:
-    log.info("Bootstrap dismissed by user")
-
-
-# --- Block 2: Reasoning toggle ---
-
-async def _handle_toggle_reasoning(ws: WebSocket, payload: dict[str, Any]) -> None:
-    global reasoning_enabled
-    reasoning_enabled = not reasoning_enabled
-    await broadcast(WSMessage(type="reasoning_toggled", payload={"enabled": reasoning_enabled}))
-    log.info("Reasoning %s", "enabled" if reasoning_enabled else "disabled")
-
-
-# --- Block 3: Action config ---
-
-async def _handle_update_actions(ws: WebSocket, payload: dict[str, Any]) -> None:
-    config = payload.get("config", {})
-    if config:
-        action_engine.update_config(config)
-    await broadcast(WSMessage(type="actions_updated", payload={"config": action_engine.config}))
-
-
-# --- Block 4: Investigation ---
-
-async def _handle_ask(ws: WebSocket, payload: dict[str, Any]) -> None:
-    question = payload.get("question", "")
-    if not question:
-        return
-
-    answer = await scene_memory.investigate(
-        question=question,
-        recent_alerts=alerts,
-    )
-
-    # Try to find relevant frames from replay buffer
-    relevant_frames: list[dict] = []
-    # For now, include the current frame as context
-    if latest_frame is not None:
-        relevant_frames.append({
-            "frame": frame_to_b64(latest_frame, quality=50),
-            "timestamp": time.time(),
-        })
-
-    await ws.send_text(WSMessage(type="ask_response", payload={
-        "answer": answer,
-        "relevant_frames": relevant_frames,
-        "question": question,
+    # Remove from old session
+    if ws in session.viewers:
+        session.viewers.remove(ws)
+    # Add to new session
+    new_session.viewers.append(ws)
+    frontend_clients[ws] = camera_id
+    # Send new session state
+    await ws.send_text(WSMessage(type="init", payload={
+        "camera_id": camera_id,
+        "zones": [z.model_dump() for z in new_session.zones],
+        "rules": [r.model_dump() for r in new_session.rules],
+        "alerts": [a.model_dump() for a in new_session.alerts[-50:]],
+        "reasoning_enabled": new_session.reasoning_enabled,
+        "narration_enabled": new_session.narration_enabled,
+        "anomaly_phase": new_session.anomaly_detector.phase.value,
+        "action_config": action_engine.config,
     }).model_dump_json())
 
 
-# --- Block 5: Narration toggle ---
+async def _handle_add_rule(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    text = payload.get("text", "")
+    if not text:
+        return
+    severity = payload.get("severity", "medium")
+    zone_names = [z.name for z in session.zones]
+    result = await rule_parser.parse(text, zone_names, severity=severity)
+    if result:
+        rule, missing = result
+        rule.camera_id = session.camera_id
+        session.rules.append(rule)
+        _persist(db.create_rule(rule))
+        rule_payload = rule.model_dump()
+        if missing:
+            rule_payload["_missing_zones"] = missing
+        await broadcast(session, WSMessage(type="rule_added", payload=rule_payload))
 
-async def _handle_toggle_narration(ws: WebSocket, payload: dict[str, Any]) -> None:
-    global narration_enabled
-    narration_enabled = not narration_enabled
-    await broadcast(WSMessage(type="narration_toggled", payload={"enabled": narration_enabled}))
-    log.info("Live narration %s", "enabled" if narration_enabled else "disabled")
+
+async def _handle_update_rule(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    rule_id = payload.get("id", "")
+    for i, r in enumerate(session.rules):
+        if r.id == rule_id:
+            updated = r.model_copy(update={k: v for k, v in payload.items() if k != "id" and hasattr(r, k)})
+            session.rules[i] = updated
+            _persist(db.update_rule(rule_id, **{k: v for k, v in payload.items() if k != "id" and hasattr(r, k)}))
+            await broadcast(session, WSMessage(type="rule_updated", payload=updated.model_dump()))
+            return
 
 
-# --- Block 6: Anomaly handlers ---
+async def _handle_delete_rule(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    rule_id = payload.get("id", "")
+    session.rules = [r for r in session.rules if r.id != rule_id]
+    _persist(db.delete_rule(rule_id))
+    await broadcast(session, WSMessage(type="rule_deleted", payload={"id": rule_id}))
 
-async def _handle_toggle_anomaly(ws: WebSocket, payload: dict[str, Any]) -> None:
-    if anomaly_detector.phase == AnomalyPhase.OFF:
-        anomaly_detector.start_learning()
-        await broadcast(WSMessage(type="anomaly_status", payload={
-            "phase": "learning",
-            "time_remaining": anomaly_detector.learning_time_remaining,
-        }))
+
+async def _handle_toggle_rule(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    rule_id = payload.get("id", "")
+    for i, r in enumerate(session.rules):
+        if r.id == rule_id:
+            updated = r.model_copy(update={"enabled": not r.enabled})
+            session.rules[i] = updated
+            _persist(db.update_rule(rule_id, enabled=not r.enabled))
+            await broadcast(session, WSMessage(type="rule_updated", payload=updated.model_dump()))
+            return
+
+
+async def _handle_update_zones(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    raw = payload.get("zones", [])
+    session.zones = [Zone.model_validate(z) for z in raw]
+    for z in session.zones:
+        z.camera_id = session.camera_id
+    _persist(db.replace_zones(session.camera_id, session.zones))
+    await broadcast(session, WSMessage(type="zones_updated", payload={"zones": [z.model_dump() for z in session.zones]}))
+
+
+async def _handle_auto_zones(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    if session.latest_frame is None:
+        return
+    generated = await zone_generator.generate(session.latest_frame)
+    for z in generated:
+        z.camera_id = session.camera_id
+    session.zones = generated
+    _persist(db.replace_zones(session.camera_id, generated))
+    await broadcast(session, WSMessage(type="zones_updated", payload={"zones": [z.model_dump() for z in generated]}))
+
+
+async def _handle_get_replay(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    ts = payload.get("timestamp", 0.0)
+    dur = payload.get("duration", 10.0)
+    frames = session.replay_buffer.get_frames(ts, dur)
+    await ws.send_text(WSMessage(type="replay", payload={
+        "frames": [{"frame": frame_to_b64(f, quality=50), "timestamp": t} for f, t in frames]
+    }).model_dump_json())
+
+
+async def _handle_get_replay_timestamps(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    ts = session.replay_buffer.get_timestamps()
+    await ws.send_text(WSMessage(type="replay_timestamps", payload={
+        "start": ts[0] if ts else 0, "end": ts[-1] if ts else 0, "count": len(ts)
+    }).model_dump_json())
+
+
+async def _handle_get_frame_at(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    result = session.replay_buffer.get_frame_at(payload.get("timestamp", 0.0))
+    if result is None:
+        await ws.send_text(WSMessage(type="replay_frame", payload={"frame": None, "timestamp": 0}).model_dump_json())
+        return
+    f, t = result
+    await ws.send_text(WSMessage(type="replay_frame", payload={"frame": frame_to_b64(f, quality=60), "timestamp": t}).model_dump_json())
+
+
+async def _handle_clear_alerts(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    session.alerts.clear()
+    _persist(db.delete_alerts_for_camera(session.camera_id))
+    await broadcast(session, WSMessage(type="alerts_cleared", payload={}))
+
+
+async def _handle_clear_rules(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    session.rules.clear()
+    session.rule_engine._last_fired.clear()
+    session.rule_engine._duration_tracking.clear()
+    _persist(db.delete_rules_for_camera(session.camera_id))
+    await broadcast(session, WSMessage(type="rules_cleared", payload={}))
+
+
+async def _handle_reset_all(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    session.zones.clear()
+    session.rules.clear()
+    session.alerts.clear()
+    session.rule_engine._last_fired.clear()
+    session.rule_engine._duration_tracking.clear()
+    session.scene_memory._entries.clear()
+    session.anomaly_detector.stop()
+    session.reasoning_enabled = False
+    session.narration_enabled = False
+    session.bootstrap_sent = False
+    _persist(db.replace_zones(session.camera_id, []))
+    _persist(db.delete_rules_for_camera(session.camera_id))
+    _persist(db.delete_alerts_for_camera(session.camera_id))
+    await broadcast(session, WSMessage(type="zones_updated", payload={"zones": []}))
+    await broadcast(session, WSMessage(type="rules_cleared", payload={}))
+    await broadcast(session, WSMessage(type="alerts_cleared", payload={}))
+    await broadcast(session, WSMessage(type="reasoning_toggled", payload={"enabled": False}))
+    await broadcast(session, WSMessage(type="narration_toggled", payload={"enabled": False}))
+    await broadcast(session, WSMessage(type="anomaly_status", payload={"phase": "off", "time_remaining": 0}))
+    if session.latest_frame is not None:
+        asyncio.create_task(_auto_bootstrap(session, session.latest_frame))
+
+
+async def _handle_generate_plan(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    text = payload.get("text", "")
+    if not text:
+        return
+    plan_zones: list[Zone] = []
+    zone_names = [z.name for z in session.zones]
+    if not session.zones and session.latest_frame is not None:
+        generated = await zone_generator.generate(session.latest_frame)
+        plan_zones = generated
+        zone_names = [z.name for z in generated]
+    result = await plan_generator.classify_and_generate(text, zone_names)
+    if result is None:
+        await ws.send_text(WSMessage(type="plan_error", payload={"error": "Failed to process."}).model_dump_json())
+        return
+    if result["type"] == "rule":
+        rule = result["rule"]
+        rule.camera_id = session.camera_id
+        session.rules.append(rule)
+        _persist(db.create_rule(rule))
+        rp = rule.model_dump()
+        missing = result.get("missing_zones", [])
+        if missing:
+            rp["_missing_zones"] = missing
+        await broadcast(session, WSMessage(type="rule_added", payload=rp))
+    elif result["type"] == "scenario":
+        pd = result["plan"]
+        plan = MonitoringPlan(name=pd["name"], description=pd["description"], scenario=pd["scenario"], rules=pd["rules"], zones=plan_zones)
+        pending_plans[plan.id] = plan
+        await ws.send_text(WSMessage(type="plan_generated", payload=plan.model_dump()).model_dump_json())
+
+
+async def _handle_apply_plan(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    plan = pending_plans.pop(payload.get("plan_id", ""), None)
+    if not plan:
+        return
+    if plan.zones:
+        for z in plan.zones:
+            z.camera_id = session.camera_id
+        session.zones = plan.zones
+        _persist(db.replace_zones(session.camera_id, plan.zones))
+        await broadcast(session, WSMessage(type="zones_updated", payload={"zones": [z.model_dump() for z in plan.zones]}))
+    for rule in plan.rules:
+        rule.camera_id = session.camera_id
+        session.rules.append(rule)
+        _persist(db.create_rule(rule))
+        await broadcast(session, WSMessage(type="rule_added", payload=rule.model_dump()))
+    await broadcast(session, WSMessage(type="plan_applied", payload={"plan_id": plan.id}))
+
+
+async def _handle_approve_bootstrap(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    colors = ["#22d3ee", "#a78bfa", "#34d399", "#fb923c", "#f472b6", "#facc15", "#60a5fa", "#e879f9"]
+    new_zones = [Zone(camera_id=session.camera_id, name=z["name"], x=float(z.get("x", 0)), y=float(z.get("y", 0)),
+                      width=float(z.get("width", 0)), height=float(z.get("height", 0)), color=colors[i % len(colors)])
+                 for i, z in enumerate(payload.get("zones", []))]
+    session.zones = new_zones
+    _persist(db.replace_zones(session.camera_id, new_zones))
+    new_rules = [Rule(camera_id=session.camera_id, name=r.get("name", ""), natural_language=r.get("natural_language", r.get("name", "")),
+                      conditions=[Condition(type=c["type"], params=c.get("params", {})) for c in r.get("conditions", [])],
+                      severity=r.get("severity", "medium"))
+                 for r in payload.get("rules", [])]
+    session.rules.extend(new_rules)
+    for rule in new_rules:
+        _persist(db.create_rule(rule))
+    await broadcast(session, WSMessage(type="zones_updated", payload={"zones": [z.model_dump() for z in new_zones]}))
+    for rule in new_rules:
+        await broadcast(session, WSMessage(type="rule_added", payload=rule.model_dump()))
+
+
+async def _handle_dismiss_bootstrap(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    pass
+
+
+async def _handle_toggle_reasoning(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    session.reasoning_enabled = not session.reasoning_enabled
+    await broadcast(session, WSMessage(type="reasoning_toggled", payload={"enabled": session.reasoning_enabled}))
+
+
+async def _handle_update_actions(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    config = payload.get("config", {})
+    if config:
+        action_engine.update_config(config)
+    await broadcast(session, WSMessage(type="actions_updated", payload={"config": action_engine.config}))
+
+
+async def _handle_ask(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    question = payload.get("question", "")
+    if not question:
+        return
+    answer = await session.scene_memory.investigate(question=question, recent_alerts=session.alerts)
+    relevant_frames: list[dict] = []
+    if session.latest_frame is not None:
+        relevant_frames.append({"frame": frame_to_b64(session.latest_frame, quality=50), "timestamp": time.time()})
+    await ws.send_text(WSMessage(type="ask_response", payload={"answer": answer, "relevant_frames": relevant_frames, "question": question}).model_dump_json())
+
+
+async def _handle_toggle_narration(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    session.narration_enabled = not session.narration_enabled
+    await broadcast(session, WSMessage(type="narration_toggled", payload={"enabled": session.narration_enabled}))
+
+
+async def _handle_toggle_anomaly(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    if session.anomaly_detector.phase == AnomalyPhase.OFF:
+        session.anomaly_detector.start_learning()
+        await broadcast(session, WSMessage(type="anomaly_status", payload={"phase": "learning", "time_remaining": session.anomaly_detector.learning_time_remaining}))
     else:
-        anomaly_detector.stop()
-        await broadcast(WSMessage(type="anomaly_status", payload={
-            "phase": "off",
-            "time_remaining": 0,
-        }))
+        session.anomaly_detector.stop()
+        await broadcast(session, WSMessage(type="anomaly_status", payload={"phase": "off", "time_remaining": 0}))
 
 
-async def _handle_set_anomaly_threshold(ws: WebSocket, payload: dict[str, Any]) -> None:
-    threshold = payload.get("threshold", 0.35)
-    anomaly_detector.threshold = float(threshold)
-    await broadcast(WSMessage(type="anomaly_status", payload={
-        "phase": anomaly_detector.phase.value,
-        "time_remaining": anomaly_detector.learning_time_remaining,
-        "threshold": anomaly_detector.threshold,
-    }))
+async def _handle_set_anomaly_threshold(session: CameraSession, ws: WebSocket, payload: dict[str, Any]) -> None:
+    session.anomaly_detector.threshold = float(payload.get("threshold", 0.35))
+    await broadcast(session, WSMessage(type="anomaly_status", payload={
+        "phase": session.anomaly_detector.phase.value, "time_remaining": session.anomaly_detector.learning_time_remaining,
+        "threshold": session.anomaly_detector.threshold}))
 
 
 # ---------------------------------------------------------------------------
-# Message handler registry
+# Handler registry
 # ---------------------------------------------------------------------------
 
-_message_handlers = {
+_message_handlers: dict[str, Any] = {
+    "subscribe": _handle_subscribe,
     "add_rule": _handle_add_rule,
     "update_rule": _handle_update_rule,
     "delete_rule": _handle_delete_rule,
@@ -1012,22 +833,14 @@ _message_handlers = {
     "clear_alerts": _handle_clear_alerts,
     "clear_rules": _handle_clear_rules,
     "reset_all": _handle_reset_all,
-    "switch_camera": _handle_switch_camera,
-    # Plan generator (API repo)
     "generate_plan": _handle_generate_plan,
     "apply_plan": _handle_apply_plan,
-    # Block 1
     "approve_bootstrap": _handle_approve_bootstrap,
     "dismiss_bootstrap": _handle_dismiss_bootstrap,
-    # Block 2
     "toggle_reasoning": _handle_toggle_reasoning,
-    # Block 3
     "update_actions": _handle_update_actions,
-    # Block 4
     "ask": _handle_ask,
-    # Block 5
     "toggle_narration": _handle_toggle_narration,
-    # Block 6
     "toggle_anomaly": _handle_toggle_anomaly,
     "set_anomaly_threshold": _handle_set_anomaly_threshold,
 }

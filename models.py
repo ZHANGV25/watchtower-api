@@ -16,11 +16,37 @@ def _now() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Cameras
+# ---------------------------------------------------------------------------
+
+class Camera(BaseModel):
+    id: str = Field(default_factory=_uuid)
+    name: str = "Unnamed Camera"
+    description: str = ""
+    location: str = ""
+    status: str = "offline"  # online | offline
+    last_seen: float = 0.0
+    created_at: float = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+
+class User(BaseModel):
+    id: str = Field(default_factory=_uuid)
+    username: str
+    password_hash: str = ""
+    created_at: float = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
 # Zones
 # ---------------------------------------------------------------------------
 
 class Zone(BaseModel):
     id: str = Field(default_factory=_uuid)
+    camera_id: str = ""
     name: str
     x: float           # percentage 0-100
     y: float
@@ -73,6 +99,7 @@ class Condition(BaseModel):
 
 class Rule(BaseModel):
     id: str = Field(default_factory=_uuid)
+    camera_id: str = ""
     name: str
     natural_language: str
     conditions: list[Condition]
@@ -101,13 +128,27 @@ class MonitoringPlan(BaseModel):
 
 class Alert(BaseModel):
     id: str = Field(default_factory=_uuid)
+    camera_id: str = ""
     rule_id: str
     rule_name: str
     severity: str
     timestamp: float = Field(default_factory=_now)
     frame_b64: str = ""
+    frame_path: str = ""
     narration: str = ""
     detections: list[Detection] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Memory Entries
+# ---------------------------------------------------------------------------
+
+class MemoryEntry(BaseModel):
+    id: str = Field(default_factory=_uuid)
+    camera_id: str = ""
+    timestamp: float = 0.0
+    summary: str = ""
+    detection_count: int = 0
 
 
 # ---------------------------------------------------------------------------

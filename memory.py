@@ -10,13 +10,11 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
-
 import anthropic
 import cv2
 import numpy as np
 
-from models import Alert, Detection
+from models import Alert, Detection, MemoryEntry
 
 log = logging.getLogger("watchtower.memory")
 
@@ -44,14 +42,6 @@ Given the memory log and the user's question, provide a clear, concise answer. R
 {alert_log}
 
 Answer the user's question based on the above context. Reference specific times using **HH:MM:SS** format (bold). Keep your answer to 2-4 sentences. If there is not enough memory to answer, say so honestly."""
-
-
-@dataclass
-class MemoryEntry:
-    timestamp: float
-    summary: str
-    detection_count: int = 0
-    alert_ids: list[str] = field(default_factory=list)
 
 
 class SceneMemory:
@@ -118,7 +108,6 @@ class SceneMemory:
                 timestamp=timestamp,
                 summary=summary,
                 detection_count=len(detections),
-                alert_ids=alert_ids,
             )
 
             self._entries.append(entry)

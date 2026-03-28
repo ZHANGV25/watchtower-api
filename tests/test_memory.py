@@ -19,17 +19,14 @@ class TestMemoryEntry:
     def test_default_values(self):
         entry = MemoryEntry(timestamp=1000.0, summary="A person standing.")
         assert entry.detection_count == 0
-        assert entry.alert_ids == []
 
     def test_custom_values(self):
         entry = MemoryEntry(
             timestamp=1000.0,
             summary="Two people in kitchen",
             detection_count=2,
-            alert_ids=["abc", "def"],
         )
         assert entry.detection_count == 2
-        assert len(entry.alert_ids) == 2
 
 
 class TestSceneMemory:

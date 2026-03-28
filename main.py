@@ -387,12 +387,17 @@ from routes.cameras import router as cameras_router
 from routes.zones import router as zones_router
 from routes.rules import router as rules_router
 from routes.alerts import router as alerts_router
+from routes.clips import router as clips_router, init_clip_processor
 
 app.include_router(auth_router)
 app.include_router(cameras_router)
 app.include_router(zones_router)
 app.include_router(rules_router)
 app.include_router(alerts_router)
+app.include_router(clips_router)
+
+# Initialize clip processor with shared singletons
+init_clip_processor(detector, narrator, action_engine, frame_store, camera_mgr)
 
 # Serve stored frames
 os.makedirs("data/frames", exist_ok=True)

@@ -26,6 +26,7 @@ class Camera(BaseModel):
     location: str = ""
     status: str = "offline"  # online | offline
     last_seen: float = 0.0
+    webrtc_url: str = ""
     created_at: float = Field(default_factory=_now)
 
 
@@ -84,6 +85,8 @@ class Detection(BaseModel):
     bbox: BBox
     pose: Optional[list[PoseKeypoint]] = None
     mask: Optional[list[PolygonPoint]] = None  # segmentation polygon outline
+    identity: str = ""  # "resident", "visitor", or "" (unknown)
+    identity_confidence: float = 0.0
 
 
 # ---------------------------------------------------------------------------

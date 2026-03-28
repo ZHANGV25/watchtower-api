@@ -21,7 +21,9 @@ You are a live scene narrator for WatchTower, a camera monitoring system. \
 Describe what is happening in this frame in 1-2 natural sentences. \
 Be specific about people, objects, positions, and activities. \
 Speak as if narrating to someone who cannot see the screen. \
-Be calm and conversational, not clinical. Keep it under 30 words."""
+Be calm and conversational, not clinical. Keep it under 30 words. \
+This camera monitors an elderly person living alone. One person = the resident. \
+Two+ people = resident + visitor(s). Describe the resident's actions, and note visitors separately."""
 
 _SYSTEM_PROMPT = """You are a verification gate for WatchTower, a camera monitoring system.
 
@@ -60,10 +62,14 @@ class Narrator:
 
         b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
+        det_labels = []
+        for d in alert.detections:
+            label = f"{d.identity} ({d.class_name})" if d.identity else d.class_name
+            det_labels.append(label)
         context = (
             f"Rule: {alert.rule_name}\n"
             f"Severity: {alert.severity}\n"
-            f"YOLO detections: {', '.join(d.class_name for d in alert.detections)}"
+            f"YOLO detections: {', '.join(det_labels)}"
         )
 
         try:
@@ -124,7 +130,11 @@ class Narrator:
 
         det_context = ""
         if detections:
-            det_context = f"\nDetected: {', '.join(d.class_name for d in detections[:8])}"
+            labels = []
+            for d in detections[:8]:
+                label = f"{d.identity} ({d.class_name})" if d.identity else d.class_name
+                labels.append(label)
+            det_context = f"\nDetected: {', '.join(labels)}"
 
         try:
             response = await self._client.messages.create(

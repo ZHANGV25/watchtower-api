@@ -24,6 +24,8 @@ _BEDROCK_MODEL_SMART = "us.anthropic.claude-sonnet-4-6"
 _SUMMARIZE_PROMPT = """\
 You are a scene logger for a camera monitoring system. Your job is to record what is happening RIGHT NOW in one concise sentence, focusing on what has CHANGED or what is noteworthy.
 
+This camera monitors an elderly person. One person in frame = the resident. Multiple people = resident + visitor(s).
+
 Focus on: who is present, what they are doing, any new objects or people, anyone leaving or arriving, changes in activity.
 
 If the scene is static and unchanged, respond with just: "No change."
@@ -75,7 +77,11 @@ class SceneMemory:
 
         det_context = ""
         if detections:
-            det_context = f"\nDetections: {', '.join(d.class_name for d in detections[:10])}"
+            labels = []
+            for d in detections[:10]:
+                label = f"{d.identity} ({d.class_name})" if d.identity else d.class_name
+                labels.append(label)
+            det_context = f"\nDetections: {', '.join(labels)}"
 
         try:
             response = await self._client.messages.create(

@@ -39,6 +39,7 @@ async def init_db() -> aiosqlite.Connection:
             location TEXT DEFAULT '',
             status TEXT DEFAULT 'offline',
             last_seen REAL DEFAULT 0,
+            webrtc_url TEXT DEFAULT '',
             created_at REAL NOT NULL
         );
 
@@ -126,8 +127,8 @@ async def close_db() -> None:
 async def create_camera(cam: Camera) -> Camera:
     db = await get_db()
     await db.execute(
-        "INSERT OR IGNORE INTO cameras (id, name, description, location, status, last_seen, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (cam.id, cam.name, cam.description, cam.location, cam.status, cam.last_seen, cam.created_at),
+        "INSERT OR IGNORE INTO cameras (id, name, description, location, status, last_seen, webrtc_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (cam.id, cam.name, cam.description, cam.location, cam.status, cam.last_seen, cam.webrtc_url, cam.created_at),
     )
     await db.commit()
     return cam

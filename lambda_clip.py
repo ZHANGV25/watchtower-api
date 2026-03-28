@@ -24,6 +24,7 @@ _detector = None
 _narrator = None
 _action_engine = None
 _frame_store = None
+_face_engine = None
 
 
 def _init():
@@ -125,6 +126,31 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
 
         frame_time = base_time + (frame_idx / clip_fps)
         detections = _detector.detect(frame, False)
+
+        # Identify people using face recognition against uploaded reference photo.
+        # Runs on every frame with people — clip processor is already at ~5fps.
+        person_count = sum(1 for d in detections if d.class_name == "person")
+        if person_count >= 1:
+            try:
+                from face_recognition_engine import FaceRecognitionEngine
+                if _face_engine is None:
+                    _face_engine_local = FaceRecognitionEngine()
+                else:
+                    _face_engine_local = _face_engine
+                if _face_engine_local.has_reference(camera_id):
+                    identifications = _face_engine_local.identify_people(camera_id, frame)
+                    for det in detections:
+                        if det.class_name == "person":
+                            det_center_y = det.bbox.y + det.bbox.height / 2
+                            for ident in identifications:
+                                face_center_y = (ident["location"][0] + ident["location"][2]) / 2
+                                if abs(det_center_y - face_center_y) < det.bbox.height:
+                                    det.identity = ident["label"]
+                                    det.identity_confidence = ident["confidence"]
+                                    break
+            except ImportError:
+                pass  # face_recognition not available
+
         fired = rule_engine.evaluate(rules, zones, detections, frame_time)
 
         for alert_data in fired:

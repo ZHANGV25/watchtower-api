@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -69,13 +70,18 @@ def frame_to_b64(frame: np.ndarray, quality: int = 70) -> str:
 
 
 async def broadcast(session: CameraSession, msg: WSMessage) -> None:
-    """Send message to all frontend viewers of this camera."""
+    """Send message to all frontend viewers of this camera.
+
+    Non-blocking: if a viewer can't receive within 0.5s, the frame is
+    dropped for that viewer.  This prevents slow WebSocket clients from
+    creating backpressure that stalls the processing loop.
+    """
     raw = msg.model_dump_json()
     dead: list[WebSocket] = []
     for ws in session.viewers:
         try:
-            await ws.send_text(raw)
-        except Exception:
+            await asyncio.wait_for(ws.send_text(raw), timeout=0.5)
+        except (asyncio.TimeoutError, Exception):
             dead.append(ws)
     for ws in dead:
         session.viewers.remove(ws)
@@ -150,6 +156,45 @@ async def camera_processing_loop(session: CameraSession) -> None:
                 if score > ad.threshold and now - last_alert_t > 30.0:
                     session._last_anomaly_alert = now  # type: ignore[attr-defined]
                     asyncio.create_task(_handle_anomaly_alert(session, frame, score, now))
+
+        # Face identification: verify identity against uploaded reference photo.
+        # Runs every 2 seconds (not every frame) to save CPU; caches the result.
+        person_count = sum(1 for d in detections if d.class_name == "person")
+        last_face_check = getattr(session, "_last_face_check", 0.0)
+        cached_ids = getattr(session, "_cached_face_ids", {})
+        if person_count >= 1 and now - last_face_check > 2.0:
+            session._last_face_check = now  # type: ignore[attr-defined]
+            try:
+                from face_recognition_engine import FaceRecognitionEngine
+                _face_engine = FaceRecognitionEngine()
+                if _face_engine.has_reference(session.camera_id):
+                    ids = await loop.run_in_executor(
+                        None, _face_engine.identify_people, session.camera_id, frame
+                    )
+                    # Cache results and apply to detections
+                    session._cached_face_ids = ids  # type: ignore[attr-defined]
+                    for det in detections:
+                        if det.class_name == "person":
+                            det_cy = det.bbox.y + det.bbox.height / 2
+                            for ident in ids:
+                                face_cy = (ident["location"][0] + ident["location"][2]) / 2
+                                if abs(det_cy - face_cy) < det.bbox.height:
+                                    det.identity = ident["label"]
+                                    det.identity_confidence = ident["confidence"]
+                                    break
+            except Exception:
+                pass
+        elif person_count >= 1 and cached_ids:
+            # Apply cached face IDs on non-check frames
+            for det in detections:
+                if det.class_name == "person":
+                    det_cy = det.bbox.y + det.bbox.height / 2
+                    for ident in cached_ids:
+                        face_cy = (ident["location"][0] + ident["location"][2]) / 2
+                        if abs(det_cy - face_cy) < det.bbox.height:
+                            det.identity = ident["label"]
+                            det.identity_confidence = ident["confidence"]
+                            break
 
         # Rule evaluation
         fired = session.rule_engine.evaluate(session.rules, session.zones, detections, now)
@@ -322,6 +367,14 @@ async def load_session_from_db(session: CameraSession) -> None:
 async def lifespan(app: FastAPI):
     await db.init_db()
 
+    # Ensure demo user exists (for local dev / hackathon demo)
+    from auth import hash_password
+    from models import User
+    demo_user = await db.get_user_by_username("vhz2020@gmail.com")
+    if not demo_user:
+        await db.create_user(User(username="vhz2020@gmail.com", password_hash=hash_password("12734836")))
+        log.info("Created demo user vhz2020@gmail.com")
+
     # Load all cameras from DB
     cameras = await db.list_cameras()
     if not cameras:
@@ -357,21 +410,63 @@ async def lifespan(app: FastAPI):
     await db.close_db()
 
 
+class _LocalFrameGrabber:
+    """Threaded frame reader for local camera, avoids OpenCV internal buffering."""
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self.cap = cap
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._frame: np.ndarray | None = None
+        self._running = True
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self) -> None:
+        while self._running:
+            ok, frame = self.cap.read()
+            if ok:
+                with self._lock:
+                    self._frame = frame
+            else:
+                break
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        with self._lock:
+            if self._frame is not None:
+                return True, self._frame.copy()
+            return False, None
+
+    def release(self) -> None:
+        self._running = False
+        self._thread.join(timeout=2)
+        if self.cap.isOpened():
+            self.cap.release()
+
+
 async def _local_camera_feeder(cap: cv2.VideoCapture, session: CameraSession) -> None:
-    """Feed frames from a local OpenCV camera into a session."""
+    """Feed frames from a local OpenCV camera into a session.
+
+    Uses a threaded reader to always grab the latest frame and avoid
+    OpenCV's internal buffer causing increasing latency.
+    """
+    grabber = _LocalFrameGrabber(cap)
     frame_interval = 1.0 / 24
     last = 0.0
-    while True:
-        now = time.time()
-        if now - last < frame_interval:
-            await asyncio.sleep(0.003)
-            continue
-        ok, frame = cap.read()
-        if not ok:
-            await asyncio.sleep(0.01)
-            continue
-        last = now
-        session.latest_frame = frame
+    try:
+        while True:
+            now = time.time()
+            if now - last < frame_interval:
+                await asyncio.sleep(0.003)
+                continue
+            ok, frame = grabber.read()
+            if not ok or frame is None:
+                await asyncio.sleep(0.01)
+                continue
+            last = now
+            session.latest_frame = frame
+    finally:
+        grabber.release()
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +483,13 @@ from routes.zones import router as zones_router
 from routes.rules import router as rules_router
 from routes.alerts import router as alerts_router
 from routes.clips import router as clips_router, init_clip_processor
+from routes.activity import router as activity_router
+from routes.status import router as status_router
+from routes.concerns import router as concerns_router
+from routes.reports import router as reports_router
+from routes.medications import router as medications_router
+from routes.investigate import router as investigate_router
+from routes.face import router as face_router
 
 app.include_router(auth_router)
 app.include_router(cameras_router)
@@ -395,6 +497,13 @@ app.include_router(zones_router)
 app.include_router(rules_router)
 app.include_router(alerts_router)
 app.include_router(clips_router)
+app.include_router(activity_router)
+app.include_router(status_router)
+app.include_router(concerns_router)
+app.include_router(reports_router)
+app.include_router(medications_router)
+app.include_router(investigate_router)
+app.include_router(face_router)
 
 # Initialize clip processor with shared singletons
 init_clip_processor(detector, narrator, action_engine, frame_store, camera_mgr)

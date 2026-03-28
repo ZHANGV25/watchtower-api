@@ -1,12 +1,16 @@
 """Camera CRUD REST endpoints."""
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import db
 from middleware import require_auth
-from models import Camera
+from models import Camera, Condition, Rule
+
+log = logging.getLogger("watchtower.cameras")
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
@@ -23,6 +27,79 @@ class CameraUpdate(BaseModel):
     location: str | None = None
 
 
+class CameraConnect(BaseModel):
+    webrtc_url: str
+
+
+# ---------------------------------------------------------------------------
+# Elder care preset rules — auto-created for every new camera
+# ---------------------------------------------------------------------------
+
+_ELDER_CARE_RULES = [
+    {
+        "name": "Fall Detection",
+        "natural_language": "Alert when a person appears to have fallen (lying on the floor)",
+        "conditions": [
+            {"type": "person_pose", "params": {"pose": "lying"}},
+            {"type": "duration", "params": {"seconds": 10}},
+        ],
+        "severity": "critical",
+    },
+    {
+        "name": "Inactivity Alert",
+        "natural_language": "Alert when no person is detected for more than 3 hours during daytime",
+        "conditions": [
+            {"type": "object_absent", "params": {"class": "person"}},
+            {"type": "duration", "params": {"seconds": 10800}},
+            {"type": "time_window", "params": {"start_hour": 7, "end_hour": 22}},
+        ],
+        "severity": "high",
+    },
+    {
+        "name": "Night Wandering",
+        "natural_language": "Alert when a person is detected moving between 11pm and 5am",
+        "conditions": [
+            {"type": "object_present", "params": {"class": "person"}},
+            {"type": "time_window", "params": {"start_hour": 23, "end_hour": 5}},
+        ],
+        "severity": "medium",
+    },
+    {
+        "name": "Visitor Detection",
+        "natural_language": "Alert when multiple people are detected in the room",
+        "conditions": [
+            {"type": "count", "params": {"class": "person", "operator": "gte", "value": 2}},
+        ],
+        "severity": "low",
+    },
+    {
+        "name": "Emergency - Prolonged Immobility",
+        "natural_language": "Alert when a person is lying on the floor with no movement for an extended period",
+        "conditions": [
+            {"type": "person_pose", "params": {"pose": "lying"}},
+            {"type": "stillness", "params": {"seconds": 60}},
+            {"type": "duration", "params": {"seconds": 120}},
+        ],
+        "severity": "critical",
+    },
+]
+
+
+async def _create_elder_care_rules(camera_id: str) -> None:
+    """Create preset elder care monitoring rules for a new camera."""
+    for rule_def in _ELDER_CARE_RULES:
+        rule = Rule(
+            camera_id=camera_id,
+            name=rule_def["name"],
+            natural_language=rule_def["natural_language"],
+            conditions=[Condition(**c) for c in rule_def["conditions"]],
+            severity=rule_def["severity"],
+            enabled=True,
+        )
+        await db.create_rule(rule)
+    log.info("Created %d elder care rules for camera %s", len(_ELDER_CARE_RULES), camera_id)
+
+
 @router.get("")
 async def list_cameras(user: dict = Depends(require_auth)):
     cameras = await db.list_cameras()
@@ -33,6 +110,8 @@ async def list_cameras(user: dict = Depends(require_auth)):
 async def create_camera(body: CameraCreate, user: dict = Depends(require_auth)):
     cam = Camera(name=body.name, description=body.description, location=body.location)
     await db.create_camera(cam)
+    # Auto-create elder care monitoring rules
+    await _create_elder_care_rules(cam.id)
     return cam.model_dump()
 
 
@@ -63,3 +142,13 @@ async def delete_camera(camera_id: str, user: dict = Depends(require_auth)):
     deleted = await db.delete_camera(camera_id)
     if not deleted:
         raise HTTPException(404, "Camera not found")
+
+
+@router.post("/{camera_id}/connect")
+async def register_camera_connection(camera_id: str, body: CameraConnect):
+    """Camera device calls this on startup to register its WebRTC signaling URL."""
+    cam = await db.get_camera(camera_id)
+    if not cam:
+        raise HTTPException(404, "Camera not found")
+    await db.update_camera(camera_id, webrtc_url=body.webrtc_url)
+    return {"status": "connected", "camera_id": camera_id}

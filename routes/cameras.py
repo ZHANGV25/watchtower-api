@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import secrets
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -11,6 +13,9 @@ from middleware import require_auth
 from models import Camera, Condition, Rule
 
 log = logging.getLogger("watchtower.cameras")
+
+# In-memory pairing codes (expire after 10 minutes)
+_pairing_codes: dict[str, dict] = {}  # code -> {"camera_id": ..., "expires": ...}
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
@@ -152,3 +157,72 @@ async def register_camera_connection(camera_id: str, body: CameraConnect):
         raise HTTPException(404, "Camera not found")
     await db.update_camera(camera_id, webrtc_url=body.webrtc_url)
     return {"status": "connected", "camera_id": camera_id}
+
+
+@router.get("/{camera_id}/health")
+async def camera_health(camera_id: str, user: dict = Depends(require_auth)):
+    """Get camera health status including connection info."""
+    cam = await db.get_camera(camera_id)
+    if not cam:
+        raise HTTPException(404, "Camera not found")
+
+    now = time.time()
+    last_seen = cam.last_seen or 0
+    seconds_ago = now - last_seen if last_seen > 0 else None
+
+    # Determine health
+    if seconds_ago is None:
+        health = "never_connected"
+    elif seconds_ago < 120:  # 2 minutes
+        health = "healthy"
+    elif seconds_ago < 600:  # 10 minutes
+        health = "stale"
+    else:
+        health = "offline"
+
+    return {
+        "camera_id": camera_id,
+        "health": health,
+        "last_seen": last_seen,
+        "seconds_ago": round(seconds_ago) if seconds_ago else None,
+        "webrtc_url": cam.webrtc_url,
+        "status": cam.status,
+    }
+
+
+@router.post("/{camera_id}/pair")
+async def generate_pairing_code(camera_id: str, user: dict = Depends(require_auth)):
+    """Generate a 6-digit pairing code for a camera."""
+    cam = await db.get_camera(camera_id)
+    if not cam:
+        raise HTTPException(404, "Camera not found")
+
+    code = f"{secrets.randbelow(1000000):06d}"
+    _pairing_codes[code] = {
+        "camera_id": camera_id,
+        "expires": time.time() + 600,  # 10 minutes
+    }
+    return {"code": code, "expires_in": 600}
+
+
+@router.post("/pair/{code}")
+async def claim_pairing_code(code: str):
+    """Camera device claims a pairing code to register itself. No auth required."""
+    # Clean expired codes
+    now = time.time()
+    expired = [k for k, v in _pairing_codes.items() if v["expires"] < now]
+    for k in expired:
+        del _pairing_codes[k]
+
+    if code not in _pairing_codes:
+        raise HTTPException(404, "Invalid or expired pairing code")
+
+    info = _pairing_codes.pop(code)
+    camera_id = info["camera_id"]
+    cam = await db.get_camera(camera_id)
+
+    return {
+        "camera_id": camera_id,
+        "camera_name": cam.name if cam else "",
+        "status": "paired",
+    }

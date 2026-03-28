@@ -490,6 +490,7 @@ from routes.reports import router as reports_router
 from routes.medications import router as medications_router
 from routes.investigate import router as investigate_router
 from routes.face import router as face_router
+from routes.seed import router as seed_router
 
 app.include_router(auth_router)
 app.include_router(cameras_router)
@@ -504,6 +505,7 @@ app.include_router(reports_router)
 app.include_router(medications_router)
 app.include_router(investigate_router)
 app.include_router(face_router)
+app.include_router(seed_router)
 
 # Initialize clip processor with shared singletons
 init_clip_processor(detector, narrator, action_engine, frame_store, camera_mgr)

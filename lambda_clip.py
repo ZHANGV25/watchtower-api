@@ -41,6 +41,38 @@ def _init():
     _frame_store = create_frame_store()
 
 
+def _generate_clip_summary(
+    classes: set[str],
+    identities: set[str],
+    person_count: int,
+    alert_count: int,
+    clip_duration_s: float,
+) -> str:
+    """Build a simple text summary from clip detection data (no LLM)."""
+    parts: list[str] = []
+
+    # Who was seen
+    if identities:
+        parts.append(f"{', '.join(sorted(identities))} seen")
+    elif person_count > 0:
+        parts.append("Person detected")
+
+    # Non-person objects
+    objects = sorted(classes - {"person"})
+    if objects:
+        parts.append(f"Objects: {', '.join(objects)}")
+
+    # Duration
+    if clip_duration_s >= 1:
+        parts.append(f"Duration: {int(clip_duration_s)}s")
+
+    # Alerts
+    if alert_count > 0:
+        parts.append(f"{alert_count} alert{'s' if alert_count != 1 else ''} triggered")
+
+    return ". ".join(parts) + "." if parts else "Activity detected."
+
+
 def handler(event, context):
     """Lambda handler — processes S3 event or direct invocation."""
     _init()
@@ -116,6 +148,11 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
     import time
     base_time = time.time()
 
+    # Collect detections across all frames for activity timeline entry
+    clip_detections: list[tuple[float, list]] = []
+    best_frame = None
+    best_frame_det_count = 0
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -150,6 +187,12 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
                                     break
             except ImportError:
                 pass  # face_recognition not available
+
+        # Track detections for activity timeline entry
+        clip_detections.append((frame_time, detections))
+        if len(detections) > best_frame_det_count:
+            best_frame_det_count = len(detections)
+            best_frame = frame.copy()
 
         fired = rule_engine.evaluate(rules, zones, detections, frame_time)
 
@@ -186,6 +229,50 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
                 await _action_engine.execute(alert, _noop)
 
     cap.release()
+
+    # --- Create activity timeline (memory) entry for this clip ---
+    try:
+        from models import MemoryEntry
+
+        all_classes: set[str] = set()
+        all_identities: set[str] = set()
+        total_person_detections = 0
+        for _ft, dets in clip_detections:
+            for det in dets:
+                all_classes.add(det.class_name)
+                if det.class_name == "person":
+                    total_person_detections += 1
+                    if det.identity:
+                        all_identities.add(det.identity)
+
+        if total_person_detections > 0:
+            # Try LLM-based summary first using narrator + the best frame
+            summary = ""
+            if _narrator and best_frame is not None:
+                try:
+                    # Gather detections from the best frame for context
+                    best_dets = max(clip_detections, key=lambda x: len(x[1]))[1]
+                    summary = await _narrator.narrate_scene(best_frame, best_dets)
+                except Exception as e:
+                    log.warning("LLM narration for memory entry failed, using fallback: %s", e)
+
+            # Fallback: simple text summary from detection data
+            if not summary:
+                summary = _generate_clip_summary(
+                    all_classes, all_identities, total_person_detections, len(alerts_created),
+                    total_frames / clip_fps,
+                )
+
+            entry = MemoryEntry(
+                timestamp=base_time,
+                summary=summary,
+                detection_count=total_person_detections,
+            )
+            await db.create_memory_entry(camera_id, entry)
+            log.info("Created memory entry for clip: %s", entry.summary[:80])
+    except Exception as e:
+        log.error("Failed to create memory entry: %s", e)
+
     os.remove(local_path)
 
     log.info("Processed: %d frames, %d alerts", frame_idx // sample_interval, len(alerts_created))

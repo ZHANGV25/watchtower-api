@@ -1,43 +1,109 @@
 # WatchTower API
 
-Backend for WatchTower, an AI-powered real-time camera monitoring system. Describe what to watch for in plain English and WatchTower handles the rest.
+Backend for WatchTower, an AI-powered elder care monitoring system. A $50 camera device that watches over elderly loved ones and alerts caregivers when something goes wrong.
 
 Built for YHack 2026.
 
 ## What It Does
 
-Captures live camera video, runs YOLO object detection + MediaPipe pose estimation every frame, evaluates user-defined rules, and fires alerts verified by a vision LLM. Includes six intelligence layers:
+Processes video clips from in-home cameras to detect falls, track daily activity patterns, monitor sleep schedules, and alert caregivers to potential emergencies. Caregivers can ask natural language questions like "What did Mom do today?" and get answers from the scene memory.
 
-- **Auto-Bootstrap** - Analyzes the scene on startup, suggests zones and monitoring rules automatically
-- **Rule Engine** - Natural language rules compiled to structured conditions (object presence, zones, pose, duration, count, time windows)
-- **Multi-Frame Reasoning** - LLM analyzes 4 frames every 10 seconds to understand sequences, intent, and context
-- **Scene Memory + Investigation** - Logs scene summaries every 30 seconds, answers natural language questions about the past
-- **Live Narration** - Continuous scene description for accessibility or ambient awareness
-- **Anomaly Detection** - Learns what "normal" looks like, alerts when something changes without needing explicit rules
-- **Agentic Actions** - Alerts trigger TTS (ElevenLabs), browser sounds, and webhooks
+## Elder Care Features
+
+### Preset Monitoring (always on)
+- **Fall detection** — Person lying on floor outside of bed area, distinguished from sleeping by location + time of day
+- **Inactivity alert** — No movement detected for 3+ hours during daytime
+- **Night wandering** — Person detected moving around between 11pm-5am
+- **Visitor detection** — Multiple people in frame (caregiver arrival, unexpected visitor)
+- **Sleep tracking** — Time to bed, wake time, nighttime disruptions
+- **Medication reminders** — Alerts caregiver if no activity near medication area by scheduled time
+- **Emergency detection** — Person on floor + no movement for extended period
+
+### Custom Concerns (user-added)
+Caregivers add concerns in plain English: "Mom forgets to drink water" or "Dad shouldn't be climbing stairs." The AI translates these into monitoring rules automatically.
+
+### Activity Timeline
+Scene memory logs activity every 30 seconds. The timeline shows: "7:15 AM — Woke up, moved to kitchen" / "7:30 AM — Seated at table (breakfast)" / "10:30 AM — On couch, watching TV."
+
+### Investigation
+Ask questions in natural language: "What did she do this morning?" / "When did she last eat?" / "Did anyone visit today?" The AI answers from its scene memory.
+
+## Architecture
+
+```
+Camera (Pi + USB webcam in each room)
+  → Motion detected → Record clip → Upload to S3
+  → S3 trigger → Lambda (YOLO + rules + LLM reasoning)
+  → DynamoDB (alerts, activity log, sleep data)
+  → Ntfy push notification to caregiver's phone
+
+Caregiver opens dashboard:
+  → REST API (Lambda + API Gateway) → DynamoDB
+  → WebRTC live check-in (P2P to camera)
+```
+
+Fully serverless. No EC2. Zero idle cost.
 
 ## Tech Stack
 
-- **Framework:** FastAPI + WebSockets
-- **Computer Vision:** YOLO v8n (ultralytics) + MediaPipe Pose
-- **LLM:** Claude via AWS Bedrock (Sonnet for reasoning/parsing, Haiku for verification/narration)
-- **Real-time:** All communication via WebSocket, async non-blocking LLM calls
+- **Framework:** FastAPI + Lambda (via Mangum)
+- **Computer Vision:** YOLO v8n (ultralytics)
+- **LLM:** Claude via AWS Bedrock (Sonnet for reasoning, Haiku for narration)
+- **Database:** DynamoDB (cameras/rooms, rules, alerts, activity log, users)
+- **Storage:** S3 (video clips, alert frames)
+- **Notifications:** Ntfy (push to phone)
+- **Live View:** WebRTC (P2P, no server relay)
+
+## API Endpoints
+
+### Auth
+- `POST /api/auth/register` — Create account
+- `POST /api/auth/login` — Sign in, get JWT
+- `GET /api/auth/me` — Current user
+
+### Cameras (Rooms)
+- `GET /api/cameras` — List all rooms/cameras
+- `POST /api/cameras` — Register a new room
+- `GET /api/cameras/{id}` — Room details + alert count
+- `PUT /api/cameras/{id}` — Update room name/location
+- `DELETE /api/cameras/{id}` — Remove room
+
+### Rules (Monitoring Concerns)
+- `GET /api/cameras/{id}/rules` — List monitoring rules for a room
+- `DELETE /api/cameras/{id}/rules/{rule_id}` — Remove a concern
+- `PATCH /api/cameras/{id}/rules/{rule_id}/toggle` — Enable/disable
+
+### Alerts
+- `GET /api/cameras/{id}/alerts` — Alert history (paginated)
+- `GET /api/alerts/{id}` — Single alert with frame
+- `DELETE /api/cameras/{id}/alerts` — Clear alerts
+
+### Clip Processing
+- `POST /api/clips/process` — Process clip from S3 (called by S3 trigger)
+- `POST /api/clips/upload` — Direct clip upload
 
 ## Setup
 
+### Local development
 ```bash
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### Environment Variables
+### Lambda deployment
+```bash
+# Build and push container images
+docker buildx build -f Dockerfile.api -t <ECR_URI>/watchtower-api:latest --platform linux/amd64 --provenance=false --push .
+docker buildx build -f Dockerfile.clip -t <ECR_URI>/watchtower-clip-processor:latest --platform linux/amd64 --provenance=false --push .
+```
 
-- `AWS_REGION` - AWS region for Bedrock (default: `us-east-1`)
-- `ELEVENLABS_API_KEY` - Optional, for TTS alerts (falls back to browser speech)
-- `ELEVENLABS_VOICE_ID` - Optional, ElevenLabs voice
-- `WATCHTOWER_WEBHOOK_URL` - Optional, POST alerts to this URL
-- `WATCHTOWER_NO_CAMERA` - Set to `1` to disable camera (testing)
-- `WATCHTOWER_SEG` - Set to `1` for segmentation masks instead of bounding boxes
+### Environment Variables
+- `WATCHTOWER_DB_BACKEND` — `sqlite` (local) or `dynamodb` (Lambda)
+- `WATCHTOWER_SECRET` — JWT signing key
+- `WATCHTOWER_NTFY_TOPIC` — Push notification topic
+- `WATCHTOWER_S3_BUCKET` — S3 bucket for clips/frames
+- `WATCHTOWER_STORAGE` — `local` or `s3`
+- `AWS_REGION` — AWS region (default: us-east-1)
 
 ## Tests
 
@@ -45,53 +111,31 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 python -m pytest tests/ -v --ignore=tests/test_websocket_integration.py --ignore=tests/test_rule_parser_integration.py --ignore=tests/test_plan_generator.py
 ```
 
-142 tests covering unit tests for all modules and integration tests for all 21 WebSocket handlers.
-
-## Architecture
-
-```
-Camera (24 fps)
-  |
-  v
-YOLO v8n + MediaPipe Pose --> Detections
-  |
-  +--> Rule Engine (boolean conditions per frame) --> Alerts
-  |      |
-  |      +--> LLM Verification (Haiku) --> Action Engine (TTS/webhook/sound)
-  |
-  +--> Reasoning Loop (Sonnet, every 10s, multi-frame)
-  |
-  +--> Memory Loop (Haiku, every 30s, scene summaries)
-  |
-  +--> Narration Loop (Haiku, every 8s, live commentary)
-  |
-  +--> Anomaly Detection (frame features, every 2s)
-  |
-  +--> Replay Buffer (30 min circular, 2 fps)
-```
-
-## WebSocket Protocol
-
-All communication via `ws://localhost:8000/ws`. Messages are JSON: `{"type": "...", "payload": {...}}`.
-
-21 message types: `add_rule`, `toggle_rule`, `delete_rule`, `update_rule`, `update_zones`, `auto_zones`, `generate_plan`, `apply_plan`, `approve_bootstrap`, `dismiss_bootstrap`, `toggle_reasoning`, `toggle_narration`, `toggle_anomaly`, `set_anomaly_threshold`, `update_actions`, `ask`, `get_replay`, `get_replay_timestamps`, `get_frame_at`, `clear_alerts`, `clear_rules`, `reset_all`.
+129 tests covering database CRUD, auth, WebSocket handlers, rule engine, anomaly detection, scene analysis, memory, and actions.
 
 ## Project Structure
 
 ```
-main.py              # FastAPI app, WebSocket handlers, background loops
-detector.py          # YOLO + MediaPipe wrapper
+main.py              # FastAPI app, multi-camera sessions, processing loops
+database.py          # SQLite async CRUD
+database_dynamo.py   # DynamoDB CRUD (Lambda mode)
+db.py                # Backend selector shim
+camera_manager.py    # Per-camera/room session management
+detector.py          # YOLO v8n + optional MediaPipe
 rule_engine.py       # Per-frame condition evaluation
-rule_parser.py       # NL -> JSON rule compiler (Sonnet)
-plan_generator.py    # Multi-rule scenario generator (Sonnet)
-scene_analyzer.py    # Auto-bootstrap scene analysis (Sonnet)
-reasoner.py          # Multi-frame reasoning loop (Sonnet)
-narrator.py          # Alert verification + live narration + anomaly comparison (Haiku)
-memory.py            # Scene memory log + investigation (Haiku/Sonnet)
-actions.py           # TTS, webhooks, browser sounds
-anomaly.py           # Frame feature extraction + anomaly scoring
-replay_buffer.py     # 30-min circular frame buffer
-zone_generator.py    # Auto-zone detection from frame (Sonnet)
-models.py            # Pydantic data models
-mask_utils.py        # Segmentation polygon extraction
+rule_parser.py       # Natural language → monitoring rules (Claude Sonnet)
+narrator.py          # Alert verification + scene narration (Claude Haiku)
+reasoner.py          # Multi-frame reasoning (sleep vs fall, activity patterns)
+memory.py            # Activity timeline + investigation Q&A
+anomaly.py           # Baseline learning + anomaly detection
+actions.py           # Push notifications, TTS, webhooks
+scene_analyzer.py    # Room analysis on first frame
+zone_generator.py    # Auto-detect room areas (bed, door, kitchen, etc.)
+storage.py           # Frame storage (local filesystem or S3)
+auth.py              # JWT tokens + password hashing
+middleware.py        # Auth dependencies
+models.py            # All data models
+routes/              # REST API endpoints
+lambda_api.py        # Lambda handler for REST API
+lambda_clip.py       # Lambda handler for clip processing
 ```

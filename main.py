@@ -58,6 +58,11 @@ connected_clients: list[WebSocket] = []
 
 camera: cv2.VideoCapture | None = None
 camera_running = False
+camera_source: str | int = int(os.getenv("WATCHTOWER_CAMERA", "0"))  # index or URL
+
+# Remote camera frame buffer (pushed by /ws/camera clients)
+remote_frame: np.ndarray | None = None
+remote_camera_connected = False
 
 # Feature toggles
 reasoning_enabled = False
@@ -101,16 +106,40 @@ async def broadcast_event(event_type: str, payload: dict[str, Any]) -> None:
 # Camera loop
 # ---------------------------------------------------------------------------
 
+async def _get_next_frame() -> np.ndarray | None:
+    """Get next frame from local camera or remote camera buffer."""
+    global remote_frame
+    if remote_camera_connected and remote_frame is not None:
+        frame = remote_frame
+        remote_frame = None  # consume it
+        return frame
+    if camera is not None and camera.isOpened():
+        ok, frame = camera.read()
+        return frame if ok else None
+    return None
+
+
 async def camera_loop() -> None:
     global camera, camera_running, bootstrap_sent, latest_detections, latest_frame
 
-    camera = cv2.VideoCapture(0)
-    if not camera.isOpened():
-        log.error("Cannot open camera")
-        return
+    # Try local camera if no remote camera is connected
+    use_local = os.getenv("WATCHTOWER_NO_CAMERA") != "1" and not remote_camera_connected
+    if use_local:
+        source = camera_source
+        # Try parsing as URL string
+        if isinstance(source, str) and not source.isdigit():
+            camera = cv2.VideoCapture(source)
+        else:
+            camera = cv2.VideoCapture(int(source) if isinstance(source, str) else source)
+        if not camera.isOpened():
+            log.warning("No local camera at source %s — waiting for remote camera", source)
+            camera = None
 
     camera_running = True
-    log.info("Camera started")
+    if camera is not None:
+        log.info("Camera started (local source: %s)", camera_source)
+    else:
+        log.info("Camera loop started — waiting for remote camera feed")
 
     frame_interval = 1.0 / 24  # target ~24 fps
     last_frame_time = 0.0
@@ -122,9 +151,9 @@ async def camera_loop() -> None:
             await asyncio.sleep(0.003)
             continue
 
-        ok, frame = camera.read()
-        if not ok:
-            await asyncio.sleep(0.01)
+        frame = await _get_next_frame()
+        if frame is None:
+            await asyncio.sleep(0.05)
             continue
 
         last_frame_time = now
@@ -442,6 +471,52 @@ app.add_middleware(
 # WebSocket handler
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Remote camera WebSocket endpoint
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/camera")
+async def camera_feed_endpoint(ws: WebSocket) -> None:
+    """Accepts frames from remote camera clients (Pi, phone, etc).
+
+    Camera clients send binary JPEG frames or JSON with base64 frame.
+    """
+    global remote_frame, remote_camera_connected
+    await ws.accept()
+    remote_camera_connected = True
+    log.info("Remote camera connected")
+
+    try:
+        while True:
+            data = await ws.receive()
+            if "bytes" in data and data["bytes"]:
+                # Binary JPEG frame — decode directly
+                buf = np.frombuffer(data["bytes"], dtype=np.uint8)
+                frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    remote_frame = frame
+            elif "text" in data and data["text"]:
+                # JSON with base64 frame
+                msg = json.loads(data["text"])
+                if "frame" in msg:
+                    import base64 as b64mod
+                    raw = b64mod.b64decode(msg["frame"])
+                    buf = np.frombuffer(raw, dtype=np.uint8)
+                    frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        remote_frame = frame
+    except WebSocketDisconnect:
+        pass
+    finally:
+        remote_camera_connected = False
+        remote_frame = None
+        log.info("Remote camera disconnected")
+
+
+# ---------------------------------------------------------------------------
+# Frontend WebSocket endpoint
+# ---------------------------------------------------------------------------
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
@@ -459,6 +534,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             "narration_enabled": narration_enabled,
             "anomaly_phase": anomaly_detector.phase.value,
             "action_config": action_engine.config,
+            "camera_source": str(camera_source),
         },
     ).model_dump_json())
 
@@ -664,6 +740,41 @@ async def _handle_reset_all(ws: WebSocket, payload: dict[str, Any]) -> None:
         ok, frame = camera.read()
         if ok:
             asyncio.create_task(_auto_bootstrap(frame))
+
+
+async def _handle_switch_camera(ws: WebSocket, payload: dict[str, Any]) -> None:
+    """Switch camera source at runtime. Accepts index (0, 1) or URL (rtsp://, http://)."""
+    global camera, camera_source, bootstrap_sent
+    source = payload.get("source", 0)
+
+    # Parse source: integer index or string URL
+    if isinstance(source, str) and source.isdigit():
+        source = int(source)
+    camera_source = source
+
+    # Close current camera
+    if camera is not None and camera.isOpened():
+        camera.release()
+
+    # Open new source
+    camera = cv2.VideoCapture(camera_source)
+    if not camera.isOpened():
+        log.error("Cannot open camera source: %s", camera_source)
+        await ws.send_text(WSMessage(
+            type="camera_error",
+            payload={"error": f"Cannot open camera: {camera_source}"},
+        ).model_dump_json())
+        return
+
+    log.info("Switched camera to: %s", camera_source)
+
+    # Re-trigger bootstrap for the new view
+    bootstrap_sent = False
+    ok, frame = camera.read()
+    if ok:
+        asyncio.create_task(_auto_bootstrap(frame))
+
+    await broadcast(WSMessage(type="camera_switched", payload={"source": str(camera_source)}))
 
 
 # --- Plan generator handlers (API repo only) ---
@@ -901,6 +1012,7 @@ _message_handlers = {
     "clear_alerts": _handle_clear_alerts,
     "clear_rules": _handle_clear_rules,
     "reset_all": _handle_reset_all,
+    "switch_camera": _handle_switch_camera,
     # Plan generator (API repo)
     "generate_plan": _handle_generate_plan,
     "apply_plan": _handle_apply_plan,

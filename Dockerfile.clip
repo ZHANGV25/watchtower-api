@@ -16,6 +16,7 @@ COPY main.py db.py database.py database_dynamo.py models.py auth.py middleware.p
      camera_manager.py actions.py narrator.py reasoner.py memory.py \
      scene_analyzer.py zone_generator.py rule_parser.py rule_engine.py \
      plan_generator.py anomaly.py replay_buffer.py detector.py mask_utils.py \
+     report_generator.py face_recognition_engine.py \
      lambda_clip.py \
      ${LAMBDA_TASK_ROOT}/
 

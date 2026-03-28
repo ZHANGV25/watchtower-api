@@ -16,7 +16,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-import database as db
+# Select database backend: "sqlite" (default) or "dynamodb"
+if os.getenv("WATCHTOWER_DB_BACKEND") == "dynamodb":
+    import database_dynamo as db
+else:
+    import database as db
 from actions import ActionEngine
 from anomaly import AnomalyPhase
 from camera_manager import CameraManager, CameraSession

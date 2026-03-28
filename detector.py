@@ -3,8 +3,14 @@ from __future__ import annotations
 import logging
 
 import cv2
-import mediapipe as mp
 import numpy as np
+
+try:
+    import mediapipe as mp
+    HAS_MEDIAPIPE = True
+except ImportError:
+    mp = None
+    HAS_MEDIAPIPE = False
 from ultralytics import YOLO
 
 from mask_utils import extract_mask_polygon
@@ -39,13 +45,17 @@ class Detector:
         log.info("Loading YOLO model: %s", yolo_model)
         self._yolo = YOLO(yolo_model)
 
-        log.info("Initializing MediaPipe Pose")
-        self._mp_pose = mp.solutions.pose.Pose(
-            static_image_mode=False,
-            model_complexity=0,  # fastest
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        self._mp_pose = None
+        if HAS_MEDIAPIPE:
+            log.info("Initializing MediaPipe Pose")
+            self._mp_pose = mp.solutions.pose.Pose(
+                static_image_mode=False,
+                model_complexity=0,  # fastest
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        else:
+            log.info("MediaPipe not available — pose detection disabled")
 
     def detect(self, frame: np.ndarray, need_pose: bool = False) -> list[Detection]:
         h, w = frame.shape[:2]

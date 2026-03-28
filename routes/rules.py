@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-import database as db
+import db
 from middleware import require_auth
 
 router = APIRouter(prefix="/api/cameras/{camera_id}/rules", tags=["rules"])

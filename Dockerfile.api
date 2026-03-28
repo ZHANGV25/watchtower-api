@@ -1,0 +1,21 @@
+FROM public.ecr.aws/lambda/python:3.11
+
+# Install system deps for opencv
+RUN yum install -y mesa-libGL glib2 && yum clean all
+
+# Copy requirements and install (API only — no YOLO/MediaPipe needed)
+COPY requirements-api.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+# Copy application code
+COPY main.py db.py database.py database_dynamo.py models.py auth.py middleware.py storage.py \
+     camera_manager.py actions.py narrator.py reasoner.py memory.py \
+     scene_analyzer.py zone_generator.py rule_parser.py rule_engine.py \
+     plan_generator.py anomaly.py replay_buffer.py detector.py mask_utils.py \
+     lambda_api.py \
+     ${LAMBDA_TASK_ROOT}/
+
+COPY routes/ ${LAMBDA_TASK_ROOT}/routes/
+
+# Lambda handler
+CMD ["lambda_api.handler"]

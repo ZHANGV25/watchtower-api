@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, File, Form, UploadFile
 
-import database as db
+import db
 from models import Alert
 
 log = logging.getLogger("watchtower.clips")

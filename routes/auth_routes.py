@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-import database as db
+import db
 from auth import create_token, hash_password, verify_password
 from middleware import require_auth
 from models import User

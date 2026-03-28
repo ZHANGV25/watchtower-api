@@ -1,0 +1,28 @@
+FROM public.ecr.aws/lambda/python:3.11
+
+# Install system deps for opencv
+RUN yum install -y mesa-libGL glib2 && yum clean all
+
+# Install CPU-only PyTorch (pre-built wheels only)
+RUN pip install --no-cache-dir --only-binary=:all: torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining dependencies (excluding mediapipe which needs native build)
+COPY requirements-clip.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir --no-deps ultralytics==8.3.145
+RUN pip install --no-cache-dir --only-binary=:all: -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+# Copy application code
+COPY main.py db.py database.py database_dynamo.py models.py auth.py middleware.py storage.py \
+     camera_manager.py actions.py narrator.py reasoner.py memory.py \
+     scene_analyzer.py zone_generator.py rule_parser.py rule_engine.py \
+     plan_generator.py anomaly.py replay_buffer.py detector.py mask_utils.py \
+     lambda_clip.py \
+     ${LAMBDA_TASK_ROOT}/
+
+COPY routes/ ${LAMBDA_TASK_ROOT}/routes/
+
+# Download YOLO model at build time (avoids cold start download)
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+
+# Lambda handler
+CMD ["lambda_clip.handler"]

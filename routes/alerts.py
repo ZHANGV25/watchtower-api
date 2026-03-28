@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-import database as db
+import db
 from middleware import require_auth
 
 router = APIRouter(prefix="/api", tags=["alerts"])

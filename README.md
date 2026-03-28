@@ -28,6 +28,27 @@ Scene memory logs activity every 30 seconds. The timeline shows: "7:15 AM — Wo
 ### Investigation
 Ask questions in natural language: "What did she do this morning?" / "When did she last eat?" / "Did anyone visit today?" The AI answers from its scene memory.
 
+### Daily Reports (ADL Tracking)
+Generates structured Activities of Daily Living reports for doctors and caregivers:
+```
+Daily Report: Mom — March 28, 2026
+Sleep: 10:45pm - 6:30am (7h 45m, 1 disruption at 2:15am)
+Meals: Breakfast 7:15am (25 min), Lunch 12:30pm (20 min), Dinner skipped
+Mobility: 14 room transitions, mostly kitchen↔living room
+Hydration: 3 cup detections (below recommended)
+Visitors: 1 visit at 3pm (45 min)
+Concerns: Dinner skipped, below-average hydration
+```
+The LLM reasoning engine compiles activity timeline entries into structured daily/weekly summaries. Exportable for clinical review.
+
+### Continuous Activity Logging
+Every 30 seconds, the system logs what the person is doing — mobility, posture, room location, objects in use. This creates a complete record of daily activity patterns that doctors can review for:
+- Declining mobility trends
+- Sleep quality deterioration
+- Meal/hydration frequency changes
+- Social isolation (fewer visitors)
+- Behavioral changes indicating cognitive decline
+
 ## Architecture
 
 ```

@@ -12,6 +12,7 @@ import os
 import tempfile
 
 import boto3
+import numpy as np
 
 os.environ["WATCHTOWER_DB_BACKEND"] = "dynamodb"
 os.environ["WATCHTOWER_NO_CAMERA"] = "1"
@@ -148,8 +149,9 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
     import time
     base_time = time.time()
 
-    # Collect detections across all frames for activity timeline entry
+    # Collect detections and sampled frames for LLM analysis
     clip_detections: list[tuple[float, list]] = []
+    clip_frames_sampled: list[tuple[np.ndarray, float]] = []  # (frame, timestamp) for LLM fall check
     best_frame = None
     best_frame_det_count = 0
 
@@ -188,8 +190,9 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
             except (ImportError, OSError):
                 pass  # face_recognition not available or filesystem issue
 
-        # Track detections for activity timeline entry
+        # Track detections and frames for activity timeline + fall detection
         clip_detections.append((frame_time, detections))
+        clip_frames_sampled.append((frame.copy(), frame_time))
         if len(detections) > best_frame_det_count:
             best_frame_det_count = len(detections)
             best_frame = frame.copy()
@@ -231,35 +234,48 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
 
     cap.release()
 
-    # --- LLM fall detection: ask Claude to check the best frame for falls ---
-    # This bypasses the rule engine entirely — works without MediaPipe or bbox heuristics.
-    if best_frame is not None and _narrator and any(
-        d.class_name == "person" for ft, dets in clip_detections for d in dets
-    ):
+    # --- LLM fall detection: send multiple frames from the clip to Claude ---
+    # Bypasses the rule engine entirely. Claude sees the sequence and judges.
+    has_people = any(d.class_name == "person" for ft, dets in clip_detections for d in dets)
+    if has_people and _narrator and clip_frames_sampled:
         try:
             import cv2 as _cv2
-            ok, buf = _cv2.imencode(".jpg", best_frame, [_cv2.IMWRITE_JPEG_QUALITY, 70])
-            if ok:
-                import base64
-                b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            import base64
+
+            # Pick ~5 evenly spaced frames from the clip for temporal context
+            n = len(clip_frames_sampled)
+            indices = [int(i * (n - 1) / min(4, n - 1)) for i in range(min(5, n))]
+            frame_images = []
+            for idx in indices:
+                frm, ts = clip_frames_sampled[idx]
+                ok, buf = _cv2.imencode(".jpg", frm, [_cv2.IMWRITE_JPEG_QUALITY, 50])
+                if ok:
+                    frame_images.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg",
+                                   "data": base64.b64encode(buf.tobytes()).decode("ascii")},
+                    })
+
+            if frame_images:
                 fall_response = await _narrator._client.messages.create(
                     model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                    max_tokens=100,
-                    system="""You are analyzing a camera frame from an elder care monitoring system.
-Look at this frame and determine if anyone has FALLEN or is LYING ON THE FLOOR.
+                    max_tokens=150,
+                    system="""You are analyzing a SEQUENCE of camera frames (in chronological order) from an elder care monitoring system.
+
+Look at the progression across frames and determine if anyone has FALLEN or is LYING ON THE FLOOR.
 
 Respond with ONLY valid JSON:
-{"fall_detected": true, "description": "Person lying on floor near desk"} or {"fall_detected": false}
+{"fall_detected": true, "description": "Person collapsed near chair between frame 2 and 3"} or {"fall_detected": false}
 
 Rules:
-- A person on the FLOOR in an unusual position = fall_detected: true
+- Look for CHANGE across frames: person upright in early frames then on the floor = FALL
+- A person on the FLOOR in an unusual position in any frame = fall_detected: true
 - A person on a bed, couch, or chair = false
-- A person standing, sitting normally, or walking = false
-- A person bent over or crouching = false (not a fall)
+- A person standing, sitting normally, bending over, or walking = false
 - When in doubt, say true (safety first)""",
                     messages=[{"role": "user", "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                        {"type": "text", "text": "Is anyone in this frame fallen or lying on the floor?"},
+                        *frame_images,
+                        {"type": "text", "text": f"These are {len(frame_images)} frames from a {int(total_frames/clip_fps)}s clip. Is anyone falling or on the floor?"},
                     ]}],
                 )
                 raw = fall_response.content[0].text.strip()
@@ -270,7 +286,6 @@ Rules:
                     raw = raw.strip()
                 fall_result = json.loads(raw)
                 if fall_result.get("fall_detected"):
-                    from storage import create_frame_store
                     fall_alert = Alert(
                         camera_id=camera_id,
                         rule_id="llm_fall_detection",
@@ -281,8 +296,8 @@ Rules:
                         narration=fall_result.get("description", "Person may have fallen"),
                         detections=[d for ft, dets in clip_detections for d in dets if d.class_name == "person"][:3],
                     )
-                    if _frame_store:
-                        frame_bytes = buf.tobytes()
+                    if _frame_store and best_frame is not None:
+                        frame_bytes = _cv2.imencode(".jpg", best_frame, [_cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
                         path = await _frame_store.save_frame(fall_alert.id, frame_bytes)
                         fall_alert.frame_path = path
                     await db.create_alert(fall_alert, frame_path=fall_alert.frame_path)

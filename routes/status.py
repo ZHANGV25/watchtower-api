@@ -103,19 +103,23 @@ async def get_status(camera_id: str, user: dict = Depends(require_auth)):
             status_text = f"Alert: {alert.get('rule_name', 'Event')} detected {mins_ago} minute{'s' if mins_ago != 1 else ''} ago"
         elif not memory_entries:
             if other_activity:
-                # Person is active in another room - this is NOT concerning
+                # Person is active in another room — not concerning
                 status_level = "good"
                 mins_ago = int((now - other_activity["timestamp"]) / 60)
                 if mins_ago < 5:
-                    status_text = f"Currently in {other_activity['room']}"
+                    status_text = f"No activity here. Currently in {other_activity['room']}."
                 else:
-                    status_text = f"Last seen in {other_activity['room']} {mins_ago} minutes ago"
+                    status_text = f"No recent activity. Last seen in {other_activity['room']} {mins_ago} min ago."
             else:
-                # No activity across ANY room - genuinely concerning
+                # No activity across ANY room — genuinely concerning
                 status_level = "warning"
                 if last_activity:
-                    hours_ago = round((now - last_activity) / 3600, 1)
-                    status_text = f"No activity detected for {hours_ago} hours"
+                    hours_ago = (now - last_activity) / 3600
+                    if hours_ago < 1:
+                        mins = int((now - last_activity) / 60)
+                        status_text = f"No activity detected for {mins} minutes"
+                    else:
+                        status_text = f"No activity detected for {int(hours_ago)} hour{'s' if int(hours_ago) != 1 else ''}"
                 else:
                     status_text = "No recent activity detected"
 
@@ -143,5 +147,5 @@ def _generate_good_status(camera_name: str, last_activity: float | None, now: fl
     elif mins_ago < 60:
         return "Activity detected in the last hour. Everything looks fine."
     else:
-        hours_ago = round(mins_ago / 60, 1)
-        return f"Last activity was {hours_ago} hours ago."
+        hours = int(mins_ago / 60)
+        return f"Last activity was {hours} hour{'s' if hours != 1 else ''} ago."

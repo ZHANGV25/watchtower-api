@@ -231,6 +231,66 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
 
     cap.release()
 
+    # --- LLM fall detection: ask Claude to check the best frame for falls ---
+    # This bypasses the rule engine entirely — works without MediaPipe or bbox heuristics.
+    if best_frame is not None and _narrator and any(
+        d.class_name == "person" for ft, dets in clip_detections for d in dets
+    ):
+        try:
+            import cv2 as _cv2
+            ok, buf = _cv2.imencode(".jpg", best_frame, [_cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                import base64
+                b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                fall_response = await _narrator._client.messages.create(
+                    model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                    max_tokens=100,
+                    system="""You are analyzing a camera frame from an elder care monitoring system.
+Look at this frame and determine if anyone has FALLEN or is LYING ON THE FLOOR.
+
+Respond with ONLY valid JSON:
+{"fall_detected": true, "description": "Person lying on floor near desk"} or {"fall_detected": false}
+
+Rules:
+- A person on the FLOOR in an unusual position = fall_detected: true
+- A person on a bed, couch, or chair = false
+- A person standing, sitting normally, or walking = false
+- A person bent over or crouching = false (not a fall)
+- When in doubt, say true (safety first)""",
+                    messages=[{"role": "user", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                        {"type": "text", "text": "Is anyone in this frame fallen or lying on the floor?"},
+                    ]}],
+                )
+                raw = fall_response.content[0].text.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.strip()
+                fall_result = json.loads(raw)
+                if fall_result.get("fall_detected"):
+                    from storage import create_frame_store
+                    fall_alert = Alert(
+                        camera_id=camera_id,
+                        rule_id="llm_fall_detection",
+                        rule_name="Fall Detection",
+                        severity="critical",
+                        timestamp=base_time,
+                        clip_s3_key=s3_key,
+                        narration=fall_result.get("description", "Person may have fallen"),
+                        detections=[d for ft, dets in clip_detections for d in dets if d.class_name == "person"][:3],
+                    )
+                    if _frame_store:
+                        frame_bytes = buf.tobytes()
+                        path = await _frame_store.save_frame(fall_alert.id, frame_bytes)
+                        fall_alert.frame_path = path
+                    await db.create_alert(fall_alert, frame_path=fall_alert.frame_path)
+                    alerts_created.append({"id": fall_alert.id, "rule_name": "Fall Detection", "severity": "critical"})
+                    log.info("LLM fall detection triggered: %s", fall_result.get("description"))
+        except Exception as e:
+            log.warning("LLM fall detection check failed: %s", e)
+
     # --- Create activity timeline (memory) entry for this clip ---
     try:
         from models import MemoryEntry

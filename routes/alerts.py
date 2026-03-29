@@ -33,12 +33,14 @@ async def list_alerts(
     cam = await db.get_camera(camera_id)
     if not cam:
         raise HTTPException(404, "Camera not found")
-    alerts = await db.list_alerts(camera_id, limit=limit, offset=offset)
+    raw_alerts = await db.list_alerts(camera_id, limit=limit + 50, offset=offset)
+    # Filter out Scene Memory entries (activity log, not real alerts)
+    alerts = [a for a in raw_alerts if a.get("rule_id") != "__memory__" and a.get("rule_name") != "Scene Memory"][:limit]
     # Presign S3 keys for frame_path
     for a in alerts:
         if a.get("frame_path"):
             a["frame_path"] = _presign(a["frame_path"])
-    total = await db.count_alerts(camera_id)
+    total = len([a for a in raw_alerts if a.get("rule_id") != "__memory__" and a.get("rule_name") != "Scene Memory"])
     return {"alerts": alerts, "total": total, "limit": limit, "offset": offset}
 
 

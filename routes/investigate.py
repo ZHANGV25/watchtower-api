@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import anthropic
 from fastapi import APIRouter, Depends, HTTPException
@@ -41,6 +41,7 @@ Answer the user's question based on the above context. Reference specific times 
 class InvestigateRequest(BaseModel):
     question: str
     time_range_minutes: int = 120  # Default: last 2 hours
+    tz_offset: int = 0  # Client timezone offset in minutes
 
 
 @router.post("")
@@ -66,11 +67,12 @@ async def investigate(camera_id: str, body: InvestigateRequest, user: dict = Dep
         camera_id, start_time=start_time, end_time=now, limit=200
     )
 
-    # Format memory log
+    # Format memory log (convert to client timezone)
+    tz_delta = timedelta(minutes=-body.tz_offset)
     if entries:
         memory_lines = []
         for e in sorted(entries, key=lambda x: x.timestamp):
-            t = datetime.fromtimestamp(e.timestamp).strftime("%I:%M %p").lstrip("0")
+            t = (datetime.utcfromtimestamp(e.timestamp) + tz_delta).strftime("%I:%M %p").lstrip("0")
             memory_lines.append(f"[{t}] {e.summary}")
         memory_log = "\n".join(memory_lines)
     else:
@@ -87,7 +89,7 @@ async def investigate(camera_id: str, body: InvestigateRequest, user: dict = Dep
     if recent_alerts:
         alert_lines = []
         for a in sorted(recent_alerts, key=lambda x: x.get("timestamp", 0)):
-            t = datetime.fromtimestamp(a.get("timestamp", 0)).strftime("%I:%M %p").lstrip("0")
+            t = (datetime.utcfromtimestamp(a.get("timestamp", 0)) + tz_delta).strftime("%I:%M %p").lstrip("0")
             alert_lines.append(
                 f"[{t}] {a.get('rule_name', 'Unknown')} ({a.get('severity', 'medium')}): {a.get('narration', '')}"
             )

@@ -97,17 +97,18 @@ def handler(event, context):
     # Handle direct invocation
     camera_id = event.get("camera_id", "")
     s3_key = event.get("s3_key", "")
+    capture_time = event.get("timestamp", 0.0)
     bucket = event.get("bucket", os.getenv("WATCHTOWER_S3_BUCKET", "watchtower-clips-008524"))
     if s3_key and camera_id:
         result = asyncio.get_event_loop().run_until_complete(
-            _process_s3_clip(bucket, s3_key, camera_id)
+            _process_s3_clip(bucket, s3_key, camera_id, capture_time=capture_time)
         )
         return result
 
     return {"status": "error", "message": "No clip to process"}
 
 
-async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
+async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_time: float = 0.0) -> dict:
     """Download clip from S3 and process it."""
     import cv2
     import database_dynamo as db
@@ -147,7 +148,9 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
     frame_idx = 0
     sample_interval = max(1, int(clip_fps / 5))  # ~5 fps analysis
     import time
-    base_time = time.time()
+    # Use the camera's capture timestamp if provided, otherwise fall back to now
+    clip_duration = total_frames / clip_fps if clip_fps > 0 else 0
+    base_time = (capture_time - clip_duration) if capture_time > 0 else time.time()
 
     # Collect detections and sampled frames for LLM analysis
     clip_detections: list[tuple[float, list]] = []

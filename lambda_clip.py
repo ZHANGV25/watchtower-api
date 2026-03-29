@@ -135,13 +135,18 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
     log.info("Processing clip: %s (%d frames at %.0f fps)", s3_key, total_frames, clip_fps)
 
     # Load rules and zones for this camera
-    rules = await db.list_rules(camera_id)
+    all_rules = await db.list_rules(camera_id)
     zones = await db.list_zones(camera_id)
 
-    if not rules:
+    if not all_rules:
         cap.release()
         os.remove(local_path)
         return {"status": "no_rules", "camera_id": camera_id}
+
+    # Split: preset rules go to rule engine, user concerns go to LLM only
+    PRESET_NAMES = {"Fall Detection", "Visitor Detection", "Inactivity Alert", "Night Wandering", "Emergency - Prolonged Immobility"}
+    rules = [r for r in all_rules if r.name in PRESET_NAMES]
+    # All rules (including user concerns) go to the LLM evaluator later
 
     rule_engine = RuleEngine()
     alerts_created = []
@@ -240,7 +245,7 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
     # --- LLM concern evaluator: send multiple frames + ALL concerns to Claude ---
     # Claude is the primary decision-maker. YOLO just confirms people/objects exist.
     has_people = any(d.class_name == "person" for ft, dets in clip_detections for d in dets)
-    if has_people and _narrator and clip_frames_sampled and rules:
+    if has_people and _narrator and clip_frames_sampled and all_rules:
         try:
             import cv2 as _cv2
             import base64
@@ -259,9 +264,9 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
                                    "data": base64.b64encode(buf.tobytes()).decode("ascii")},
                     })
 
-            # Build concern list from all enabled rules (skip medication reminders — can't detect from video)
+            # Build concern list from ALL rules (skip medication reminders — can't detect from video)
             concern_list = []
-            for r in rules:
+            for r in all_rules:
                 if r.enabled and not r.name.startswith("MED:"):
                     desc = r.natural_language or r.name
                     concern_list.append({"id": r.id, "name": r.name, "description": desc, "severity": r.severity})
@@ -333,7 +338,7 @@ Guidelines:
                     description = triggered.get("description", "")
 
                     # Find the matching rule
-                    rule = next((r for r in rules if r.id == rule_id), None)
+                    rule = next((r for r in all_rules if r.id == rule_id), None)
                     if not rule:
                         rule_name = triggered.get("name", "Concern Triggered")
                         severity = "medium"

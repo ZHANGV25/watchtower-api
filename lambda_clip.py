@@ -237,10 +237,10 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
 
     cap.release()
 
-    # --- LLM fall detection: send multiple frames from the clip to Claude ---
-    # Bypasses the rule engine entirely. Claude sees the sequence and judges.
+    # --- LLM concern evaluator: send multiple frames + ALL concerns to Claude ---
+    # Claude is the primary decision-maker. YOLO just confirms people/objects exist.
     has_people = any(d.class_name == "person" for ft, dets in clip_detections for d in dets)
-    if has_people and _narrator and clip_frames_sampled:
+    if has_people and _narrator and clip_frames_sampled and rules:
         try:
             import cv2 as _cv2
             import base64
@@ -259,55 +259,111 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
                                    "data": base64.b64encode(buf.tobytes()).decode("ascii")},
                     })
 
-            if frame_images:
-                fall_response = await _narrator._client.messages.create(
+            # Build concern list from all enabled rules
+            concern_list = []
+            for r in rules:
+                if r.enabled:
+                    desc = r.natural_language or r.name
+                    concern_list.append({"id": r.id, "name": r.name, "description": desc, "severity": r.severity})
+
+            if frame_images and concern_list:
+                concerns_text = "\n".join(
+                    f"- [{c['id']}] {c['name']} ({c['severity']}): {c['description']}"
+                    for c in concern_list
+                )
+
+                # Collect YOLO detection summary
+                all_detected = set()
+                for ft, dets in clip_detections:
+                    for d in dets:
+                        all_detected.add(d.class_name)
+
+                llm_response = await _narrator._client.messages.create(
                     model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
-                    max_tokens=150,
-                    system="""You are analyzing a SEQUENCE of camera frames (in chronological order) from an elder care monitoring system.
+                    max_tokens=500,
+                    system=f"""You are the monitoring brain for WatchTower, an elder care camera system.
 
-Look at the progression across frames and determine if anyone has FALLEN or is LYING ON THE FLOOR.
+You are shown {len(frame_images)} frames from a {int(total_frames/clip_fps)}s video clip, in chronological order. YOLO detected: {', '.join(sorted(all_detected))}.
 
-Respond with ONLY valid JSON:
-{"fall_detected": true, "description": "Person collapsed near chair between frame 2 and 3"} or {"fall_detected": false}
+The caregiver has set these concerns to monitor for:
+{concerns_text}
 
-Rules:
-- Look for CHANGE across frames: person upright in early frames then on the floor = FALL
-- A person on the FLOOR in an unusual position in any frame = fall_detected: true
-- A person on a bed, couch, or chair = false
-- A person standing, sitting normally, bending over, or walking = false
-- When in doubt, say true (safety first)""",
+Analyze the frame sequence and determine which concerns (if any) are triggered.
+
+Respond with ONLY valid JSON (no markdown):
+{{
+  "triggered": [
+    {{"id": "rule_id_here", "description": "Brief explanation of what you see", "confidence": "high/medium/low"}}
+  ]
+}}
+
+Return an EMPTY triggered array if nothing concerning is happening.
+
+Guidelines:
+- Look at the PROGRESSION across frames, not just individual frames
+- A fall = person upright then on the floor. Person on bed/couch = NOT a fall.
+- Inactivity = no person visible in ANY frame (the room is empty)
+- Night wandering = person moving AND it's nighttime (check if scene looks dark/nighttime)
+- Be conservative — only trigger if you genuinely see the concern happening
+- "confidence" helps prioritize: high = clearly happening, medium = likely, low = possible""",
                     messages=[{"role": "user", "content": [
                         *frame_images,
-                        {"type": "text", "text": f"These are {len(frame_images)} frames from a {int(total_frames/clip_fps)}s clip. Is anyone falling or on the floor?"},
+                        {"type": "text", "text": "Which concerns, if any, are triggered in this clip?"},
                     ]}],
                 )
-                raw = fall_response.content[0].text.strip()
+
+                raw = llm_response.content[0].text.strip()
                 if raw.startswith("```"):
                     raw = raw.split("```")[1]
                     if raw.startswith("json"):
                         raw = raw[4:]
                     raw = raw.strip()
-                fall_result = json.loads(raw)
-                if fall_result.get("fall_detected"):
-                    fall_alert = Alert(
+                result = json.loads(raw)
+
+                for triggered in result.get("triggered", []):
+                    rule_id = triggered.get("id", "")
+                    description = triggered.get("description", "")
+                    confidence = triggered.get("confidence", "medium")
+
+                    # Find the matching rule
+                    rule = next((r for r in rules if r.id == rule_id), None)
+                    if not rule:
+                        # LLM might return "llm_fall_detection" or similar
+                        rule_name = triggered.get("name", "Concern Triggered")
+                        severity = "medium"
+                    else:
+                        rule_name = rule.name
+                        severity = rule.severity
+
+                    # Skip low confidence unless critical severity
+                    if confidence == "low" and severity not in ("critical", "high"):
+                        continue
+
+                    # Check cooldown — don't duplicate alerts from rule engine
+                    existing = [a for a in alerts_created if a.get("rule_name") == rule_name]
+                    if existing:
+                        continue
+
+                    concern_alert = Alert(
                         camera_id=camera_id,
-                        rule_id="llm_fall_detection",
-                        rule_name="Fall Detection",
-                        severity="critical",
+                        rule_id=rule_id or "llm_concern",
+                        rule_name=rule_name,
+                        severity=severity,
                         timestamp=base_time,
                         clip_s3_key=s3_key,
-                        narration=fall_result.get("description", "Person may have fallen"),
+                        narration=description,
                         detections=[d for ft, dets in clip_detections for d in dets if d.class_name == "person"][:3],
                     )
                     if _frame_store and best_frame is not None:
                         frame_bytes = _cv2.imencode(".jpg", best_frame, [_cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
-                        path = await _frame_store.save_frame(fall_alert.id, frame_bytes)
-                        fall_alert.frame_path = path
-                    await db.create_alert(fall_alert, frame_path=fall_alert.frame_path)
-                    alerts_created.append({"id": fall_alert.id, "rule_name": "Fall Detection", "severity": "critical"})
-                    log.info("LLM fall detection triggered: %s", fall_result.get("description"))
+                        path = await _frame_store.save_frame(concern_alert.id, frame_bytes)
+                        concern_alert.frame_path = path
+                    await db.create_alert(concern_alert, frame_path=concern_alert.frame_path)
+                    alerts_created.append({"id": concern_alert.id, "rule_name": rule_name, "severity": severity})
+                    log.info("LLM concern triggered: %s — %s (confidence: %s)", rule_name, description, confidence)
+
         except Exception as e:
-            log.warning("LLM fall detection check failed: %s", e)
+            log.warning("LLM concern evaluation failed: %s", e)
 
     # --- Create activity timeline (memory) entry for this clip ---
     try:

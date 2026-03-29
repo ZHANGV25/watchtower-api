@@ -49,6 +49,29 @@ app.include_router(face_router)
 app.include_router(seed_router)
 app.include_router(webrtc_proxy_router)
 
+
+# ---------------------------------------------------------------------------
+# Clip processing proxy — invokes the clip-processor Lambda asynchronously
+# ---------------------------------------------------------------------------
+import json
+import boto3
+
+_lambda_client = boto3.client("lambda", region_name=os.getenv("AWS_REGION", "us-east-1"))
+
+@app.post("/api/clips/process")
+async def process_clip_proxy(body: dict):
+    """Proxy clip processing to the dedicated clip-processor Lambda."""
+    try:
+        _lambda_client.invoke(
+            FunctionName="watchtower-clip-processor",
+            InvocationType="Event",  # async — don't wait
+            Payload=json.dumps(body),
+        )
+        return {"status": "queued", "message": "Clip processing started"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/")
 async def root():
     return {"service": "watchtower-api", "status": "ok"}

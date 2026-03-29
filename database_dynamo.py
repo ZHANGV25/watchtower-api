@@ -239,6 +239,9 @@ async def get_alert(alert_id: str) -> dict | None:
     item = resp.get("Item")
     return _from_decimal(item) if item else None
 
+async def delete_alert(alert_id: str) -> None:
+    _alerts.delete_item(Key={"id": alert_id})
+
 async def delete_alerts_for_camera(camera_id: str) -> None:
     alerts = await list_alerts(camera_id, limit=1000)
     for a in alerts:

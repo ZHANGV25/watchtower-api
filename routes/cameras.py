@@ -48,10 +48,9 @@ class CameraConnect(BaseModel):
 _ELDER_CARE_RULES = [
     {
         "name": "Fall Detection",
-        "natural_language": "Alert when a person appears to have fallen (lying on the floor)",
+        "natural_language": "Alert when a person appears to have fallen or is lying on the floor",
         "conditions": [
             {"type": "person_pose", "params": {"pose": "lying"}},
-            {"type": "duration", "params": {"seconds": 10}},
         ],
         "severity": "critical",
     },
@@ -66,31 +65,12 @@ _ELDER_CARE_RULES = [
         "severity": "high",
     },
     {
-        "name": "Night Wandering",
-        "natural_language": "Alert when a person is detected moving between 11pm and 5am",
-        "conditions": [
-            {"type": "object_present", "params": {"class": "person"}},
-            {"type": "time_window", "params": {"start_hour": 23, "end_hour": 5}},
-        ],
-        "severity": "medium",
-    },
-    {
         "name": "Visitor Detection",
         "natural_language": "Alert when multiple people are detected in the room",
         "conditions": [
             {"type": "count", "params": {"class": "person", "operator": "gte", "value": 2}},
         ],
         "severity": "low",
-    },
-    {
-        "name": "Emergency - Prolonged Immobility",
-        "natural_language": "Alert when a person is lying on the floor with no movement for an extended period",
-        "conditions": [
-            {"type": "person_pose", "params": {"pose": "lying"}},
-            {"type": "stillness", "params": {"seconds": 60}},
-            {"type": "duration", "params": {"seconds": 120}},
-        ],
-        "severity": "critical",
     },
 ]
 

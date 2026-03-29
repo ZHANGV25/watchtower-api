@@ -75,6 +75,12 @@ async def get_alert_clip(alert_id: str, user: dict = Depends(require_auth)):
     return {"clip_url": url, "s3_key": clip_key, "alert_timestamp": float(alert_ts)}
 
 
+@router.delete("/alerts/{alert_id}", status_code=204)
+async def dismiss_alert(alert_id: str, user: dict = Depends(require_auth)):
+    """Dismiss/resolve a single alert."""
+    await db.delete_alert(alert_id)
+
+
 @router.delete("/cameras/{camera_id}/alerts", status_code=204)
 async def clear_alerts(camera_id: str, user: dict = Depends(require_auth)):
     await db.delete_alerts_for_camera(camera_id)

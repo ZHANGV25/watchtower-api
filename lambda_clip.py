@@ -319,8 +319,11 @@ Guidelines:
                         raw = raw[4:]
                     raw = raw.strip()
                 result = json.loads(raw)
+                triggered_list = result.get("triggered", [])
+                log.info("LLM concern evaluator: %d concerns checked, %d triggered",
+                         len(concern_list), len(triggered_list))
 
-                for triggered in result.get("triggered", []):
+                for triggered in triggered_list:
                     rule_id = triggered.get("id", "")
                     description = triggered.get("description", "")
                     confidence = triggered.get("confidence", "medium")

@@ -30,6 +30,7 @@ router = APIRouter(prefix="/api/cameras/{camera_id}/activity", tags=["activity"]
 async def get_activity_timeline(
     camera_id: str,
     date: str | None = Query(None, description="Date in YYYY-MM-DD format (defaults to today)"),
+    tz_offset: int = Query(0, description="Client timezone offset in minutes (e.g., -240 for EDT)"),
     limit: int = Query(200, ge=1, le=1000),
     user: dict = Depends(require_auth),
 ):
@@ -42,18 +43,22 @@ async def get_activity_timeline(
     if not cam:
         raise HTTPException(404, "Camera not found")
 
-    # Parse date or default to today
+    # Apply timezone offset so date boundaries match the client's local time
+    tz_delta = timedelta(minutes=-tz_offset)
+
+    # Parse date or default to today in client's timezone
     if date:
         try:
             target_date = datetime.strptime(date, "%Y-%m-%d")
         except ValueError:
             raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
     else:
-        target_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        target_date = (datetime.utcnow() + tz_delta).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Compute start/end timestamps for the day
-    start_time = target_date.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    end_time = (target_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    # Compute start/end timestamps for the day in UTC
+    local_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_time = (local_start - tz_delta).timestamp()
+    end_time = (local_start + timedelta(days=1) - tz_delta).timestamp()
 
     entries = await db.list_memory_entries(camera_id, start_time=start_time, end_time=end_time, limit=limit)
 

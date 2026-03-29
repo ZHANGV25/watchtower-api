@@ -251,7 +251,7 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
             frame_images = []
             for idx in indices:
                 frm, ts = clip_frames_sampled[idx]
-                ok, buf = _cv2.imencode(".jpg", frm, [_cv2.IMWRITE_JPEG_QUALITY, 50])
+                ok, buf = _cv2.imencode(".jpg", frm, [_cv2.IMWRITE_JPEG_QUALITY, 70])
                 if ok:
                     frame_images.append({
                         "type": "image",
@@ -259,10 +259,10 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
                                    "data": base64.b64encode(buf.tobytes()).decode("ascii")},
                     })
 
-            # Build concern list from all enabled rules
+            # Build concern list from all enabled rules (skip medication reminders — can't detect from video)
             concern_list = []
             for r in rules:
-                if r.enabled:
+                if r.enabled and not r.name.startswith("MED:"):
                     desc = r.natural_language or r.name
                     concern_list.append({"id": r.id, "name": r.name, "description": desc, "severity": r.severity})
 
@@ -278,12 +278,19 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
                     for d in dets:
                         all_detected.add(d.class_name)
 
+                from datetime import datetime, timezone, timedelta
+                # Estimate local time (assume US Eastern for now)
+                clip_local_time = datetime.fromtimestamp(base_time, tz=timezone(timedelta(hours=-4)))
+                time_str = clip_local_time.strftime("%I:%M %p")
+                hour = clip_local_time.hour
+                time_context = "nighttime" if hour < 6 or hour >= 22 else "daytime"
+
                 llm_response = await _narrator._client.messages.create(
                     model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
                     max_tokens=500,
                     system=f"""You are the monitoring brain for WatchTower, an elder care camera system.
 
-You are shown {len(frame_images)} frames from a {int(total_frames/clip_fps)}s video clip, in chronological order. YOLO detected: {', '.join(sorted(all_detected))}.
+You are shown {len(frame_images)} frames from a {int(total_frames/clip_fps)}s video clip, in chronological order. Current time: {time_str} ({time_context}). YOLO detected: {', '.join(sorted(all_detected))}.
 
 The caregiver has set these concerns to monitor for:
 {concerns_text}
@@ -293,7 +300,7 @@ Analyze the frame sequence and determine which concerns (if any) are triggered.
 Respond with ONLY valid JSON (no markdown):
 {{
   "triggered": [
-    {{"id": "rule_id_here", "description": "Brief explanation of what you see", "confidence": "high/medium/low"}}
+    {{"id": "rule_id_here", "description": "Brief description of what you see"}}
   ]
 }}
 
@@ -301,11 +308,9 @@ Return an EMPTY triggered array if nothing concerning is happening.
 
 Guidelines:
 - Look at the PROGRESSION across frames, not just individual frames
-- A fall = person upright then on the floor. Person on bed/couch = NOT a fall.
-- Inactivity = no person visible in ANY frame (the room is empty)
-- Night wandering = person moving AND it's nighttime (check if scene looks dark/nighttime)
-- Be conservative — only trigger if you genuinely see the concern happening
-- "confidence" helps prioritize: high = clearly happening, medium = likely, low = possible""",
+- Only describe what you can CLEARLY see — do not guess at unclear objects
+- A fall = person was upright then is on the floor. Person on bed/couch = NOT a fall
+- Only trigger concerns you are confident about from the visual evidence""",
                     messages=[{"role": "user", "content": [
                         *frame_images,
                         {"type": "text", "text": "Which concerns, if any, are triggered in this clip?"},
@@ -326,21 +331,15 @@ Guidelines:
                 for triggered in triggered_list:
                     rule_id = triggered.get("id", "")
                     description = triggered.get("description", "")
-                    confidence = triggered.get("confidence", "medium")
 
                     # Find the matching rule
                     rule = next((r for r in rules if r.id == rule_id), None)
                     if not rule:
-                        # LLM might return "llm_fall_detection" or similar
                         rule_name = triggered.get("name", "Concern Triggered")
                         severity = "medium"
                     else:
                         rule_name = rule.name
                         severity = rule.severity
-
-                    # Skip low confidence unless critical severity
-                    if confidence == "low" and severity not in ("critical", "high"):
-                        continue
 
                     # Check cooldown — don't duplicate alerts from rule engine
                     existing = [a for a in alerts_created if a.get("rule_name") == rule_name]
@@ -363,7 +362,7 @@ Guidelines:
                         concern_alert.frame_path = path
                     await db.create_alert(concern_alert, frame_path=concern_alert.frame_path)
                     alerts_created.append({"id": concern_alert.id, "rule_name": rule_name, "severity": severity})
-                    log.info("LLM concern triggered: %s — %s (confidence: %s)", rule_name, description, confidence)
+                    log.info("LLM concern triggered: %s — %s", rule_name, description)
 
         except Exception as e:
             log.warning("LLM concern evaluation failed: %s", e)

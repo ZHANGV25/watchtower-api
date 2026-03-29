@@ -55,16 +55,6 @@ _ELDER_CARE_RULES = [
         "severity": "critical",
     },
     {
-        "name": "Inactivity Alert",
-        "natural_language": "Alert when no person is detected for more than 3 hours during daytime",
-        "conditions": [
-            {"type": "object_absent", "params": {"class": "person"}},
-            {"type": "duration", "params": {"seconds": 10800}},
-            {"type": "time_window", "params": {"start_hour": 7, "end_hour": 22}},
-        ],
-        "severity": "high",
-    },
-    {
         "name": "Visitor Detection",
         "natural_language": "Alert when multiple people are detected in the room",
         "conditions": [

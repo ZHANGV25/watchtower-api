@@ -171,7 +171,7 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
             try:
                 from face_recognition_engine import FaceRecognitionEngine
                 if _face_engine is None:
-                    _face_engine_local = FaceRecognitionEngine()
+                    _face_engine_local = FaceRecognitionEngine(data_dir="/tmp/face_data")
                 else:
                     _face_engine_local = _face_engine
                 if _face_engine_local.has_reference(camera_id):
@@ -185,8 +185,8 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
                                     det.identity = ident["label"]
                                     det.identity_confidence = ident["confidence"]
                                     break
-            except ImportError:
-                pass  # face_recognition not available
+            except (ImportError, OSError):
+                pass  # face_recognition not available or filesystem issue
 
         # Track detections for activity timeline entry
         clip_detections.append((frame_time, detections))

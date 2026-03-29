@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import time
 
+import boto3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import db
 from middleware import require_auth
 from models import Camera, Condition, Rule
+
+_S3_BUCKET = os.getenv("WATCHTOWER_S3_BUCKET", "watchtower-clips-008524")
+_s3 = boto3.client("s3")
 
 log = logging.getLogger("watchtower.cameras")
 
@@ -105,10 +110,32 @@ async def _create_elder_care_rules(camera_id: str) -> None:
     log.info("Created %d elder care rules for camera %s", len(_ELDER_CARE_RULES), camera_id)
 
 
+def _presign(s3_key: str) -> str:
+    if not s3_key or s3_key.startswith("http"):
+        return s3_key
+    return _s3.generate_presigned_url(
+        "get_object", Params={"Bucket": _S3_BUCKET, "Key": s3_key}, ExpiresIn=3600,
+    )
+
+
 @router.get("")
 async def list_cameras(user: dict = Depends(require_auth)):
     cameras = await db.list_cameras()
-    return {"cameras": [c.model_dump() for c in cameras]}
+    result = []
+    for c in cameras:
+        data = c.model_dump()
+        # Attach latest snapshot for grid preview
+        try:
+            now = time.time()
+            entries = await db.list_memory_entries(c.id, start_time=now - 86400, end_time=now, limit=1)
+            if entries and getattr(entries[0], "frame_url", ""):
+                data["latest_frame"] = _presign(entries[0].frame_url)
+            else:
+                data["latest_frame"] = ""
+        except Exception:
+            data["latest_frame"] = ""
+        result.append(data)
+    return {"cameras": result}
 
 
 @router.post("", status_code=201)

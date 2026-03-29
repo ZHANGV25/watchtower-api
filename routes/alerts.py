@@ -54,20 +54,25 @@ async def get_alert(alert_id: str, user: dict = Depends(require_auth)):
 
 @router.get("/alerts/{alert_id}/clip")
 async def get_alert_clip(alert_id: str, user: dict = Depends(require_auth)):
-    """Get a presigned URL for the alert's clip video."""
+    """Get a presigned URL for the alert's clip video with seek offset."""
     alert = await db.get_alert(alert_id)
     if not alert:
         raise HTTPException(404, "Alert not found")
     clip_key = alert.get("clip_s3_key", "") if isinstance(alert, dict) else getattr(alert, "clip_s3_key", "")
     if not clip_key:
         raise HTTPException(404, "No clip associated with this alert")
-    s3 = boto3.client("s3")
-    url = s3.generate_presigned_url(
+    url = _s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": _S3_BUCKET, "Key": clip_key},
         ExpiresIn=3600,
     )
-    return {"clip_url": url, "s3_key": clip_key}
+    # Find other alerts from the same clip to determine clip start time
+    alert_ts = alert.get("timestamp", 0) if isinstance(alert, dict) else getattr(alert, "timestamp", 0)
+    camera_id = alert.get("camera_id", "") if isinstance(alert, dict) else getattr(alert, "camera_id", "")
+    # Estimate: alert happened ~midway through clip, seek to 5s before alert moment
+    # Clips are max 60s, alert timestamp is absolute. We return the timestamp
+    # so frontend can calculate seek position relative to clip start.
+    return {"clip_url": url, "s3_key": clip_key, "alert_timestamp": float(alert_ts)}
 
 
 @router.delete("/cameras/{camera_id}/alerts", status_code=204)

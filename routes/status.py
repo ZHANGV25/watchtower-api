@@ -38,6 +38,7 @@ async def get_status(camera_id: str, user: dict = Depends(require_auth)):
         a for a in all_alerts
         if a.get("timestamp", 0) >= twenty_four_hours_ago
         and a.get("rule_id") != "__memory__"
+        and a.get("rule_name") != "Scene Memory"
     ]
 
     # Count alerts today (midnight to now)

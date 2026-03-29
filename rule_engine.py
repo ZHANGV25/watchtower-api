@@ -36,10 +36,10 @@ def _estimate_pose_state(detection: Detection) -> str:
         if bbox.width > 0 and bbox.height > 0:
             aspect = bbox.width / bbox.height
             # Person wider than tall → likely lying down
-            if aspect > 1.4:
+            if aspect > 1.2:
                 return "lying"
             # Very squat → sitting or crouching
-            if aspect > 0.9:
+            if aspect > 0.85:
                 return "sitting"
             return "standing"
         return "unknown"

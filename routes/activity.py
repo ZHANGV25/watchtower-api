@@ -1,13 +1,27 @@
 """Activity timeline REST endpoint for elder care dashboard."""
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timedelta
 
+import boto3
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import db
 from middleware import require_auth
+
+_S3_BUCKET = os.getenv("WATCHTOWER_S3_BUCKET", "watchtower-clips-008524")
+_s3 = boto3.client("s3")
+
+
+def _presign(s3_key: str) -> str:
+    """Convert an S3 key to a presigned URL. Pass through if already a URL or empty."""
+    if not s3_key or s3_key.startswith("http"):
+        return s3_key
+    return _s3.generate_presigned_url(
+        "get_object", Params={"Bucket": _S3_BUCKET, "Key": s3_key}, ExpiresIn=3600,
+    )
 
 router = APIRouter(prefix="/api/cameras/{camera_id}/activity", tags=["activity"])
 
@@ -53,7 +67,7 @@ async def get_activity_timeline(
                 "time": datetime.fromtimestamp(e.timestamp).strftime("%I:%M %p").lstrip("0"),
                 "summary": e.summary,
                 "detection_count": e.detection_count,
-                "frame_url": getattr(e, "frame_url", "") or "",
+                "frame_url": _presign(getattr(e, "frame_url", "") or ""),
             }
             for e in sorted(entries, key=lambda x: x.timestamp)
         ],

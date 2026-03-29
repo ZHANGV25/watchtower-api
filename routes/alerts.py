@@ -10,8 +10,17 @@ import db
 from middleware import require_auth
 
 _S3_BUCKET = os.getenv("WATCHTOWER_S3_BUCKET", "watchtower-clips-008524")
+_s3 = boto3.client("s3")
 
 router = APIRouter(prefix="/api", tags=["alerts"])
+
+
+def _presign(s3_key: str) -> str:
+    if not s3_key or s3_key.startswith("http"):
+        return s3_key
+    return _s3.generate_presigned_url(
+        "get_object", Params={"Bucket": _S3_BUCKET, "Key": s3_key}, ExpiresIn=3600,
+    )
 
 
 @router.get("/cameras/{camera_id}/alerts")
@@ -25,6 +34,10 @@ async def list_alerts(
     if not cam:
         raise HTTPException(404, "Camera not found")
     alerts = await db.list_alerts(camera_id, limit=limit, offset=offset)
+    # Presign S3 keys for frame_path
+    for a in alerts:
+        if a.get("frame_path"):
+            a["frame_path"] = _presign(a["frame_path"])
     total = await db.count_alerts(camera_id)
     return {"alerts": alerts, "total": total, "limit": limit, "offset": offset}
 

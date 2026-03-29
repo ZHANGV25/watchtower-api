@@ -54,14 +54,6 @@ _ELDER_CARE_RULES = [
         ],
         "severity": "critical",
     },
-    {
-        "name": "Visitor Detection",
-        "natural_language": "Alert when multiple people are detected in the room",
-        "conditions": [
-            {"type": "count", "params": {"class": "person", "operator": "gte", "value": 2}},
-        ],
-        "severity": "low",
-    },
 ]
 
 

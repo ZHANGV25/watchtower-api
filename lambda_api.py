@@ -29,6 +29,7 @@ from routes.medications import router as medications_router
 from routes.investigate import router as investigate_router
 from routes.face import router as face_router
 from routes.seed import router as seed_router
+from routes.webrtc_proxy import router as webrtc_proxy_router
 
 app = FastAPI(title="WatchTower API (Lambda)")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -46,6 +47,7 @@ app.include_router(medications_router)
 app.include_router(investigate_router)
 app.include_router(face_router)
 app.include_router(seed_router)
+app.include_router(webrtc_proxy_router)
 
 @app.get("/")
 async def root():

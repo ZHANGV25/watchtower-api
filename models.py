@@ -152,6 +152,7 @@ class MemoryEntry(BaseModel):
     timestamp: float = 0.0
     summary: str = ""
     detection_count: int = 0
+    frame_url: str = ""  # S3 presigned URL or path to a snapshot frame
 
 
 # ---------------------------------------------------------------------------

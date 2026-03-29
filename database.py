@@ -92,6 +92,7 @@ async def init_db() -> aiosqlite.Connection:
             timestamp REAL NOT NULL,
             summary TEXT NOT NULL,
             detection_count INTEGER DEFAULT 0,
+            frame_url TEXT DEFAULT '',
             created_at REAL NOT NULL DEFAULT 0
         );
 
@@ -367,8 +368,8 @@ async def get_user(user_id: str) -> User | None:
 async def create_memory_entry(camera_id: str, entry: MemoryEntry) -> None:
     db = await get_db()
     await db.execute(
-        "INSERT INTO memory_entries (id, camera_id, timestamp, summary, detection_count, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (entry.id, camera_id, entry.timestamp, entry.summary, entry.detection_count, time.time()),
+        "INSERT INTO memory_entries (id, camera_id, timestamp, summary, detection_count, frame_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (entry.id, camera_id, entry.timestamp, entry.summary, entry.detection_count, entry.frame_url or "", time.time()),
     )
     await db.commit()
 

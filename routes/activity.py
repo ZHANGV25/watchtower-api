@@ -48,10 +48,12 @@ async def get_activity_timeline(
         "camera_id": camera_id,
         "entries": [
             {
+                "id": e.id,
                 "timestamp": e.timestamp,
                 "time": datetime.fromtimestamp(e.timestamp).strftime("%I:%M %p").lstrip("0"),
                 "summary": e.summary,
                 "detection_count": e.detection_count,
+                "frame_url": getattr(e, "frame_url", "") or "",
             }
             for e in sorted(entries, key=lambda x: x.timestamp)
         ],

@@ -291,6 +291,7 @@ async def create_memory_entry(camera_id: str, entry: MemoryEntry) -> None:
         "narration": entry.summary,
         "detections_json": "[]",
         "detection_count": entry.detection_count,
+        "frame_url": entry.frame_url or "",
         "created_at": time.time(),
     }))
 
@@ -309,4 +310,5 @@ async def list_memory_entries(camera_id: str, start_time: float = 0, end_time: f
     return [MemoryEntry(
         id=i["id"], camera_id=camera_id, timestamp=i["timestamp"],
         summary=i.get("narration", ""), detection_count=i.get("detection_count", 0),
+        frame_url=i.get("frame_url", ""),
     ) for i in items[:limit]]

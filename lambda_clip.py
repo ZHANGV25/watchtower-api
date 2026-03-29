@@ -263,10 +263,21 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
                     total_frames / clip_fps,
                 )
 
+            # Save snapshot frame to S3 for visual proof
+            frame_url = ""
+            if best_frame is not None and _frame_store:
+                try:
+                    frame_bytes = cv2.imencode(".jpg", best_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+                    frame_key = f"timeline_{camera_id}_{int(base_time)}"
+                    frame_url = await _frame_store.save_frame(frame_key, frame_bytes)
+                except Exception as e:
+                    log.warning("Failed to save timeline frame: %s", e)
+
             entry = MemoryEntry(
                 timestamp=base_time,
                 summary=summary,
                 detection_count=total_person_detections,
+                frame_url=frame_url,
             )
             await db.create_memory_entry(camera_id, entry)
             log.info("Created memory entry for clip: %s", entry.summary[:80])

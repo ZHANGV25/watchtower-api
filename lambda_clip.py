@@ -42,6 +42,60 @@ def _init():
     _frame_store = create_frame_store()
 
 
+def _annotate_frame(frame: np.ndarray, detections: list, alert_name: str = "") -> np.ndarray:
+    """Draw YOLO bounding boxes and labels on a frame for alert evidence."""
+    import cv2 as _cv2
+    annotated = frame.copy()
+    h, w = annotated.shape[:2]
+
+    SEVERITY_COLORS = {
+        "person": (0, 200, 80),      # green
+        "default": (200, 160, 0),     # cyan-ish
+    }
+
+    for det in detections:
+        bbox = det.bbox
+        # Convert percentage coords to pixels
+        x1 = int(bbox.x * w / 100)
+        y1 = int(bbox.y * h / 100)
+        x2 = int((bbox.x + bbox.width) * w / 100)
+        y2 = int((bbox.y + bbox.height) * h / 100)
+
+        color = SEVERITY_COLORS.get(det.class_name, SEVERITY_COLORS["default"])
+        thickness = 2
+
+        # Draw corner brackets (L-shaped) instead of full rectangle
+        corner_len = min(20, (x2 - x1) // 4, (y2 - y1) // 4)
+        # Top-left
+        _cv2.line(annotated, (x1, y1), (x1 + corner_len, y1), color, thickness)
+        _cv2.line(annotated, (x1, y1), (x1, y1 + corner_len), color, thickness)
+        # Top-right
+        _cv2.line(annotated, (x2, y1), (x2 - corner_len, y1), color, thickness)
+        _cv2.line(annotated, (x2, y1), (x2, y1 + corner_len), color, thickness)
+        # Bottom-left
+        _cv2.line(annotated, (x1, y2), (x1 + corner_len, y2), color, thickness)
+        _cv2.line(annotated, (x1, y2), (x1, y2 - corner_len), color, thickness)
+        # Bottom-right
+        _cv2.line(annotated, (x2, y2), (x2 - corner_len, y2), color, thickness)
+        _cv2.line(annotated, (x2, y2), (x2, y2 - corner_len), color, thickness)
+
+        # Label
+        label = f"{det.class_name} {det.confidence:.0%}"
+        font = _cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.45
+        (tw, th), _ = _cv2.getTextSize(label, font, font_scale, 1)
+        _cv2.rectangle(annotated, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+        _cv2.putText(annotated, label, (x1 + 2, y1 - 4), font, font_scale, (0, 0, 0), 1, _cv2.LINE_AA)
+
+    # Alert name overlay at top
+    if alert_name:
+        font = _cv2.FONT_HERSHEY_SIMPLEX
+        _cv2.putText(annotated, alert_name, (8, 22), font, 0.6, (0, 0, 255), 2, _cv2.LINE_AA)
+        _cv2.putText(annotated, alert_name, (8, 22), font, 0.6, (255, 255, 255), 1, _cv2.LINE_AA)
+
+    return annotated
+
+
 def _generate_clip_summary(
     classes: set[str],
     identities: set[str],
@@ -225,9 +279,10 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str, capture_tim
                     continue
                 alert.narration = result.note
 
-            # Save frame
+            # Save annotated frame with bounding boxes
             if _frame_store:
-                frame_bytes = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+                annotated = _annotate_frame(frame, detections, alert.rule_name)
+                frame_bytes = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
                 path = await _frame_store.save_frame(alert.id, frame_bytes)
                 alert.frame_path = path
 
@@ -362,7 +417,9 @@ Guidelines:
                         detections=[d for ft, dets in clip_detections for d in dets if d.class_name == "person"][:3],
                     )
                     if _frame_store and best_frame is not None:
-                        frame_bytes = _cv2.imencode(".jpg", best_frame, [_cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+                        best_dets = max(clip_detections, key=lambda x: len(x[1]))[1] if clip_detections else []
+                        annotated = _annotate_frame(best_frame, best_dets, rule_name)
+                        frame_bytes = _cv2.imencode(".jpg", annotated, [_cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
                         path = await _frame_store.save_frame(concern_alert.id, frame_bytes)
                         concern_alert.frame_path = path
                     await db.create_alert(concern_alert, frame_path=concern_alert.frame_path)

@@ -25,6 +25,18 @@ class ConcernCreate(BaseModel):
     severity: str = "medium"
 
 
+@router.get("")
+async def list_concerns(camera_id: str, user: dict = Depends(require_auth)):
+    """List all monitoring concerns (rules with natural language origin)."""
+    cam = await db.get_camera(camera_id)
+    if not cam:
+        raise HTTPException(404, "Camera not found")
+    rules = await db.list_rules(camera_id)
+    # Return rules that have natural_language set (i.e., created from concerns)
+    concerns = [r.model_dump() for r in rules if r.natural_language]
+    return {"concerns": concerns}
+
+
 @router.post("")
 async def create_concern(camera_id: str, body: ConcernCreate, user: dict = Depends(require_auth)):
     """Convert a natural language concern into a monitoring rule.

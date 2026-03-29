@@ -1,10 +1,15 @@
 """Alert query REST endpoints."""
 from __future__ import annotations
 
+import os
+
+import boto3
 from fastapi import APIRouter, Depends, HTTPException
 
 import db
 from middleware import require_auth
+
+_S3_BUCKET = os.getenv("WATCHTOWER_S3_BUCKET", "watchtower-clips-008524")
 
 router = APIRouter(prefix="/api", tags=["alerts"])
 
@@ -30,6 +35,24 @@ async def get_alert(alert_id: str, user: dict = Depends(require_auth)):
     if not alert:
         raise HTTPException(404, "Alert not found")
     return alert
+
+
+@router.get("/alerts/{alert_id}/clip")
+async def get_alert_clip(alert_id: str, user: dict = Depends(require_auth)):
+    """Get a presigned URL for the alert's clip video."""
+    alert = await db.get_alert(alert_id)
+    if not alert:
+        raise HTTPException(404, "Alert not found")
+    clip_key = alert.get("clip_s3_key", "") if isinstance(alert, dict) else getattr(alert, "clip_s3_key", "")
+    if not clip_key:
+        raise HTTPException(404, "No clip associated with this alert")
+    s3 = boto3.client("s3")
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": _S3_BUCKET, "Key": clip_key},
+        ExpiresIn=3600,
+    )
+    return {"clip_url": url, "s3_key": clip_key}
 
 
 @router.delete("/cameras/{camera_id}/alerts", status_code=204)

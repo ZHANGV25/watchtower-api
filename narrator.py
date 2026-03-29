@@ -25,7 +25,7 @@ Be calm and conversational, not clinical. Keep it under 30 words. \
 This camera monitors an elderly person living alone. One person = the resident. \
 Two+ people = resident + visitor(s). Describe the resident's actions, and note visitors separately."""
 
-_SYSTEM_PROMPT = """You are a verification gate for WatchTower, a camera monitoring system.
+_SYSTEM_PROMPT = """You are a verification gate for WatchTower, an elder care camera monitoring system.
 
 A detection rule has fired based on YOLO object detection. Your job is to look at the camera frame and verify whether the alert is a true positive or a false positive.
 
@@ -33,13 +33,19 @@ Respond with ONLY valid JSON (no markdown, no explanation):
 {"confirmed": true} or {"confirmed": false}
 
 Only add a "note" field if the situation is genuinely ambiguous or noteworthy:
-{"confirmed": true, "note": "Two people near the restricted zone, one may be entering"}
+{"confirmed": true, "note": "Person on floor near furniture, possible fall"}
 
 Rules:
 - confirmed=true: The scene clearly matches what the rule describes
 - confirmed=false: YOLO misidentified something, or the scene does not match the rule
 - Keep notes under 20 words. Most responses should have no note at all.
-- When in doubt, confirm. False negatives are worse than false positives."""
+- When in doubt, confirm. False negatives are worse than false positives.
+
+FALL DETECTION: When the rule is about falling or lying down, look carefully at:
+- Is the person on the floor (not on a bed/couch/chair)?
+- Is their body position horizontal or crumpled?
+- Does it look like an uncontrolled fall vs intentional lying/resting?
+- A person lying on a bed or couch is NOT a fall. A person on the floor IS concerning."""
 
 
 @dataclass

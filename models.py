@@ -138,6 +138,7 @@ class Alert(BaseModel):
     timestamp: float = Field(default_factory=_now)
     frame_b64: str = ""
     frame_path: str = ""
+    clip_s3_key: str = ""
     narration: str = ""
     detections: list[Detection] = Field(default_factory=list)
 

@@ -203,6 +203,7 @@ async def _process_s3_clip(bucket: str, s3_key: str, camera_id: str) -> dict:
                 rule_name=alert_data.rule_name,
                 severity=alert_data.severity,
                 timestamp=frame_time,
+                clip_s3_key=s3_key,
                 detections=detections[:5],
             )
 

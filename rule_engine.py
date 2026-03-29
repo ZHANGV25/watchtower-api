@@ -28,8 +28,20 @@ def _bbox_height_ratio(bbox: BBox) -> float:
 
 
 def _estimate_pose_state(detection: Detection) -> str:
-    """Estimate pose from keypoints: standing, sitting, lying, crouching."""
+    """Estimate pose from keypoints or bbox fallback: standing, sitting, lying, crouching."""
+
+    # Fallback: use bounding box aspect ratio when no keypoints (e.g., Lambda without MediaPipe)
     if not detection.pose:
+        bbox = detection.bbox
+        if bbox.width > 0 and bbox.height > 0:
+            aspect = bbox.width / bbox.height
+            # Person wider than tall → likely lying down
+            if aspect > 1.4:
+                return "lying"
+            # Very squat → sitting or crouching
+            if aspect > 0.9:
+                return "sitting"
+            return "standing"
         return "unknown"
 
     kp = {p.name: p for p in detection.pose}
